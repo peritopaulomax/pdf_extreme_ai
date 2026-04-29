@@ -8,6 +8,8 @@ from urllib.request import urlopen
 import torch
 from qdrant_client import QdrantClient
 
+from proxy_env import configure_proxy_env_for_local_services
+
 
 @dataclass
 class RetrievalProfile:
@@ -142,14 +144,7 @@ def _build_profiles() -> dict[str, RetrievalProfile]:
 
 
 def configure_runtime_env() -> RuntimeSettings:
-    no_proxy_set = {"127.0.0.1", "localhost", "::1"}
-    for key in ("NO_PROXY", "no_proxy"):
-        existing = os.environ.get(key, "")
-        if existing.strip():
-            no_proxy_set.update(part.strip() for part in existing.split(",") if part.strip())
-    no_proxy = ",".join(sorted(no_proxy_set))
-    os.environ["NO_PROXY"] = no_proxy
-    os.environ["no_proxy"] = no_proxy
+    configure_proxy_env_for_local_services()
 
     os.environ.setdefault("OMP_NUM_THREADS", "24")
     os.environ.setdefault("MKL_NUM_THREADS", "24")

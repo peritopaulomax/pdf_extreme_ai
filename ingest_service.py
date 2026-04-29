@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from proxy_env import configure_proxy_env_for_local_services
+
+configure_proxy_env_for_local_services()
+
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter, SentenceWindowNodeParser
 from llama_index.core.schema import MetadataMode
