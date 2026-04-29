@@ -8,6 +8,15 @@ from urllib.request import urlopen
 import torch
 from qdrant_client import QdrantClient
 
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
 
 @dataclass
 class RetrievalProfile:
@@ -141,7 +150,15 @@ def _build_profiles() -> dict[str, RetrievalProfile]:
     return {"rapido": rapido, "preciso": preciso, "pericial": pericial}
 
 
-def configure_runtime_env() -> RuntimeSettings:
+def prepare_httpx_proxy_env() -> None:
+    """Normaliza variaveis de proxy para evitar erro de esquema no httpx."""
+    for key in PROXY_ENV_KEYS:
+        value = os.environ.get(key, "").strip()
+        if not value:
+            continue
+        if value.lower().startswith("socks://"):
+            os.environ[key] = f"socks5://{value[len('socks://'):]}"
+
     no_proxy_set = {"127.0.0.1", "localhost", "::1"}
     for key in ("NO_PROXY", "no_proxy"):
         existing = os.environ.get(key, "")
@@ -150,6 +167,10 @@ def configure_runtime_env() -> RuntimeSettings:
     no_proxy = ",".join(sorted(no_proxy_set))
     os.environ["NO_PROXY"] = no_proxy
     os.environ["no_proxy"] = no_proxy
+
+
+def configure_runtime_env() -> RuntimeSettings:
+    prepare_httpx_proxy_env()
 
     os.environ.setdefault("OMP_NUM_THREADS", "24")
     os.environ.setdefault("MKL_NUM_THREADS", "24")

@@ -5,6 +5,10 @@ from pathlib import Path
 
 import streamlit as st
 import torch
+from runtime_config import prepare_httpx_proxy_env
+
+prepare_httpx_proxy_env()
+
 from llama_index.core import Settings, VectorStoreIndex
 from llama_index.core.chat_engine import CondensePlusContextChatEngine
 from llama_index.core.memory import Memory

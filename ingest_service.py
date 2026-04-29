@@ -10,6 +10,10 @@ from llama_index.core import Settings, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter, SentenceWindowNodeParser
 from llama_index.core.schema import MetadataMode
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from runtime_config import prepare_httpx_proxy_env
+
+prepare_httpx_proxy_env()
+
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client.models import Distance, HnswConfigDiff, VectorParams
