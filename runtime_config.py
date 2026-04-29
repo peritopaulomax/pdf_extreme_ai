@@ -189,11 +189,11 @@ def configure_runtime_env() -> RuntimeSettings:
         qdrant_hnsw_ef=_int_env("QDRANT_HNSW_EF", 96),
         embedding_model_path=os.environ.get(
             "EMBEDDING_MODEL_PATH",
-            "/home/paulopmgir/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181",
+            "BAAI/bge-m3",
         ),
         reranker_model_path=os.environ.get(
             "RERANKER_MODEL_PATH",
-            "/home/paulopmgir/.cache/huggingface/hub/models--BAAI--bge-reranker-base/snapshots/2cfc18c9415c912f9d8155881c133215df768a70",
+            "BAAI/bge-reranker-base",
         ),
         llm_model=default_model,
         llm_models=model_list,
