@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import http_proxy_bootstrap  # noqa: F401 — strip socks:// etc. before ollama/httpx import
+
 import json
 import time
 from dataclasses import dataclass

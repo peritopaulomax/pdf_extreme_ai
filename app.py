@@ -1,4 +1,7 @@
 import os
+
+import http_proxy_bootstrap  # noqa: F401 — strip socks:// etc. before ollama/httpx import
+
 import tempfile
 import hashlib
 from pathlib import Path
