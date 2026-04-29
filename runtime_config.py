@@ -9,6 +9,25 @@ import torch
 from qdrant_client import QdrantClient
 
 
+def normalize_proxy_env() -> None:
+    """Normalize proxy env vars to schemes accepted by httpx/ollama."""
+    proxy_keys = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    )
+    for key in proxy_keys:
+        raw = os.environ.get(key, "")
+        value = raw.strip()
+        if not value:
+            continue
+        if value.lower().startswith("socks://"):
+            os.environ[key] = f"socks5://{value[len('socks://'):]}"
+
+
 @dataclass
 class RetrievalProfile:
     name: str
@@ -142,6 +161,8 @@ def _build_profiles() -> dict[str, RetrievalProfile]:
 
 
 def configure_runtime_env() -> RuntimeSettings:
+    normalize_proxy_env()
+
     no_proxy_set = {"127.0.0.1", "localhost", "::1"}
     for key in ("NO_PROXY", "no_proxy"):
         existing = os.environ.get(key, "")

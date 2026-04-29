@@ -3,6 +3,10 @@ import tempfile
 import hashlib
 from pathlib import Path
 
+from runtime_config import normalize_proxy_env
+
+normalize_proxy_env()
+
 import streamlit as st
 import torch
 from llama_index.core import Settings, VectorStoreIndex
