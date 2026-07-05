@@ -141,7 +141,7 @@ sequenceDiagram
   U->>APP: Upload PDF(s)
   APP->>ING: run_ingest(project_id, paths)
   ING->>PDF: extract_pdf_to_documents
-  Note over PDF: PyMuPDF/pypdf; OCR se ENABLE_OCR
+  Note over PDF: PyMuPDF/pypdf OCR se ENABLE_OCR
   ING->>ING: SentenceWindowNodeParser
   ING->>Q: VectorStoreIndex (embeddings CUDA/CPU)
   ING->>L: upsert_many (chunks)
