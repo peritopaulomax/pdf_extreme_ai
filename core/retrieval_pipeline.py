@@ -303,174 +303,27 @@ class HybridRetriever(BaseRetriever):
 
     def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
         query = query_bundle.query_str or ""
-        plan = plan_query(query, self.settings, forced_profile=self.forced_profile)
-        profile = self.settings.retrieval_profiles[plan.profile]
+        plan, profile = self._build_plan(query)
         page_filter = plan.requested_page
         page_range = plan.requested_page_range
         source_hint = plan.requested_source_hint
         section_markers = _section_markers(plan.requested_section)
-        critical_intent = plan.intent in (
-            "literal_exaustivo",
-            "cadeia_custodia",
-            "forense_autenticidade",
-            "tese_acusacao_defesa",
-            "auditoria_exaustiva",
-        ) or page_range is not None
-        semantic_top_k = profile.semantic_top_k * (2 if critical_intent else 1)
-        lexical_top_k = profile.lexical_top_k * (2 if critical_intent else 1)
 
-        expanded = expand_query(
-            query,
-            project_memory=self.project_memory,
-            intent=plan.intent,
+        expanded, query_variants = self._expand_query_variants(query, plan)
+        semantic_nodes, lex_nodes, exhaustive_pages, page_groups = self._retrieve_nodes(
+            expanded, query_variants, plan, profile
         )
-        query_variants = [expanded]
-        if (
-            self.settings.multi_query_mode != "off"
-            and not page_filter
-            and plan.intent in ("analitico", "padrao", "historico_documental", "tese_acusacao_defesa")
-        ):
-            alts = build_multi_queries(
-                query,
-                intent=plan.intent,
-                max_queries=max(1, self.settings.multi_query_max_subq),
-            )
-            expanded_alts = [
-                expand_query(item, project_memory=self.project_memory, intent=plan.intent)
-                for item in alts
-            ]
-            query_variants = fuse_query_lists(expanded, expanded_alts)
+        page_nodes = self._retrieve_page_nodes(expanded, plan, profile)
 
-        exhaustive_pages = 0
-        page_groups: list[PageOccurrence] = []
-        if plan.intent == "auditoria_exaustiva":
-            ex_hits, page_groups = search_exhaustive(
-                self.lexical_index,
-                expanded,
-                batch_size=self.settings.exhaustive_batch_size,
-                max_total=self.settings.exhaustive_max_hits,
-                page_filter=page_filter,
-                page_range=page_range,
-                source_hint=source_hint,
-            )
-            exhaustive_pages = len(page_groups)
-            lex_nodes = _hits_to_nodes(ex_hits[: profile.reranker_candidate_k])
-            semantic_nodes: list[NodeWithScore] = []
-        else:
-            sem_retriever = self.index.as_retriever(similarity_top_k=semantic_top_k)
-            semantic_nodes = []
-            lexical_hits = []
-            for idx, variant in enumerate(query_variants):
-                variant_bundle = QueryBundle(query_str=variant)
-                batch_semantic = sem_retriever.retrieve(variant_bundle)
-                batch_semantic = [
-                    item
-                    for item in batch_semantic
-                    if _matches_filters(item, page_filter, page_range, source_hint)
-                ]
-                if idx:
-                    for item in batch_semantic:
-                        item.score = float(item.score or 0.0) * max(0.75, 1.0 - 0.08 * idx)
-                semantic_nodes.extend(batch_semantic)
-                lexical_hits.extend(
-                    self.lexical_index.search(
-                        variant,
-                        limit=lexical_top_k,
-                        page_filter=page_filter,
-                        page_range=page_range,
-                        source_hint=source_hint,
-                    )
-                )
-            lex_nodes = _hits_to_nodes(lexical_hits)
+        self._apply_section_boost(semantic_nodes, section_markers)
+        self._apply_section_boost(lex_nodes, section_markers)
 
-        page_nodes: list[NodeWithScore] = []
-        if self.page_index and (page_filter or page_range):
-            for ph in self.page_index.search(
-                expanded,
-                limit=min(12, profile.reranker_candidate_k),
-                page_filter=page_filter,
-                page_range=page_range,
-                source_hint=source_hint,
-            ):
-                node = TextNode(
-                    text=ph.text,
-                    metadata={
-                        "source_file": ph.source_file,
-                        "page": ph.page,
-                        "page_level": True,
-                        "doc_type": ph.doc_type,
-                        "doc_number": ph.doc_number,
-                    },
-                )
-                page_nodes.append(NodeWithScore(node=node, score=ph.score + 0.05))
-
-        for idx, item in enumerate(semantic_nodes):
-            if section_markers:
-                body = item.node.get_content(metadata_mode=MetadataMode.NONE).lower()
-                if any(marker in body for marker in section_markers):
-                    item.score = float(item.score or 0.0) + 0.15
-
-        for idx, item in enumerate(lex_nodes):
-            if section_markers:
-                body = item.node.get_content(metadata_mode=MetadataMode.NONE).lower()
-                if any(marker in body for marker in section_markers):
-                    item.score = float(item.score or 0.0) + 0.15
-
-        ranked_lists = [semantic_nodes, lex_nodes]
-        if page_nodes:
-            ranked_lists.append(page_nodes)
-        fused_map = _rrf_fuse(ranked_lists, _key_of)
-        fused_nodes = sorted(
-            fused_map.values(), key=lambda n: float(n.score or 0.0), reverse=True
-        )
-        fused_nodes = _diversify_nodes(fused_nodes, profile.reranker_candidate_k)
-
-        graph_expansion_count = 0
-        if self.project_id:
-            graph = load_graph(self.project_id)
-            if graph:
-                related_pairs: list[tuple[str, str]] = []
-                seen_pairs: set[tuple[str, str]] = set()
-                for seed in _seed_ref_keys(fused_nodes):
-                    parsed_seed = _parse_ref_key(seed)
-                    if parsed_seed and parsed_seed not in seen_pairs:
-                        seen_pairs.add(parsed_seed)
-                        related_pairs.append(parsed_seed)
-                    entry = graph.get(seed) or {}
-                    for related in entry.get("references") or []:
-                        parsed = _parse_ref_key(str(related))
-                        if parsed and parsed not in seen_pairs:
-                            seen_pairs.add(parsed)
-                            related_pairs.append(parsed)
-                extra_hits = self.lexical_index.search_by_doc_refs(
-                    related_pairs,
-                    limit=max(4, profile.reranker_top_n // 2),
-                )
-                extra_nodes = _hits_to_nodes(extra_hits)
-                existing_keys = {_key_of(item) for item in fused_nodes}
-                for item in extra_nodes:
-                    key = _key_of(item)
-                    if key in existing_keys:
-                        continue
-                    existing_keys.add(key)
-                    item.score = float(item.score or 0.0) + 0.03
-                    fused_nodes.append(item)
-                if extra_nodes:
-                    fused_nodes = sorted(
-                        fused_nodes, key=lambda n: float(n.score or 0.0), reverse=True
-                    )
-                    fused_nodes = _diversify_nodes(fused_nodes, profile.reranker_candidate_k)
-                    graph_expansion_count = len(extra_nodes)
-
-        fused_nodes, entity_boost_count = _boost_entity_coverage(
-            fused_nodes,
-            self.project_id,
-        )
+        fused_nodes = self._fuse_and_diversify(semantic_nodes, lex_nodes, page_nodes, profile)
+        fused_nodes, graph_expansion_count = self._apply_graph_expansion(fused_nodes, profile)
+        fused_nodes, entity_boost_count = _boost_entity_coverage(fused_nodes, self.project_id)
         fused_nodes = _diversify_nodes(fused_nodes, profile.reranker_candidate_k)
         fused_nodes, parent_context_count = _add_parent_context_nodes(
-            fused_nodes,
-            self.page_index,
-            self.settings,
+            fused_nodes, self.page_index, self.settings
         )
 
         literal_count = len(lex_nodes) if plan.intent != "auditoria_exaustiva" else exhaustive_pages
@@ -494,3 +347,194 @@ class HybridRetriever(BaseRetriever):
         self.last_retrieved_nodes = list(fused_nodes)
         self.last_audit_pages = list(page_groups)
         return fused_nodes
+
+    def _build_plan(self, query: str) -> tuple[QueryPlan, Any]:
+        plan = plan_query(query, self.settings, forced_profile=self.forced_profile)
+        profile = self.settings.retrieval_profiles[plan.profile]
+        return plan, profile
+
+    def _expand_query_variants(self, query: str, plan: QueryPlan) -> tuple[str, list[str]]:
+        expanded = expand_query(
+            query,
+            project_memory=self.project_memory,
+            intent=plan.intent,
+        )
+        query_variants = [expanded]
+        if (
+            self.settings.multi_query_mode != "off"
+            and not plan.requested_page
+            and plan.intent in ("analitico", "padrao", "historico_documental", "tese_acusacao_defesa")
+        ):
+            alts = build_multi_queries(
+                query,
+                intent=plan.intent,
+                max_queries=max(1, self.settings.multi_query_max_subq),
+            )
+            expanded_alts = [
+                expand_query(item, project_memory=self.project_memory, intent=plan.intent)
+                for item in alts
+            ]
+            query_variants = fuse_query_lists(expanded, expanded_alts)
+        return expanded, query_variants
+
+    def _retrieve_nodes(
+        self,
+        expanded: str,
+        query_variants: list[str],
+        plan: QueryPlan,
+        profile: Any,
+    ) -> tuple[list[NodeWithScore], list[NodeWithScore], int, list[PageOccurrence]]:
+        page_filter = plan.requested_page
+        page_range = plan.requested_page_range
+        source_hint = plan.requested_source_hint
+        critical_intent = plan.intent in (
+            "literal_exaustivo",
+            "cadeia_custodia",
+            "forense_autenticidade",
+            "tese_acusacao_defesa",
+            "auditoria_exaustiva",
+        ) or page_range is not None
+        semantic_top_k = profile.semantic_top_k * (2 if critical_intent else 1)
+        lexical_top_k = profile.lexical_top_k * (2 if critical_intent else 1)
+
+        if plan.intent == "auditoria_exaustiva":
+            ex_hits, page_groups = search_exhaustive(
+                self.lexical_index,
+                expanded,
+                batch_size=self.settings.exhaustive_batch_size,
+                max_total=self.settings.exhaustive_max_hits,
+                page_filter=page_filter,
+                page_range=page_range,
+                source_hint=source_hint,
+            )
+            lex_nodes = _hits_to_nodes(ex_hits[: profile.reranker_candidate_k])
+            return [], lex_nodes, len(page_groups), page_groups
+
+        sem_retriever = self.index.as_retriever(similarity_top_k=semantic_top_k)
+        semantic_nodes: list[NodeWithScore] = []
+        lexical_hits = []
+        for idx, variant in enumerate(query_variants):
+            variant_bundle = QueryBundle(query_str=variant)
+            batch_semantic = sem_retriever.retrieve(variant_bundle)
+            batch_semantic = [
+                item
+                for item in batch_semantic
+                if _matches_filters(item, page_filter, page_range, source_hint)
+            ]
+            if idx:
+                for item in batch_semantic:
+                    item.score = float(item.score or 0.0) * max(0.75, 1.0 - 0.08 * idx)
+            semantic_nodes.extend(batch_semantic)
+            lexical_hits.extend(
+                self.lexical_index.search(
+                    variant,
+                    limit=lexical_top_k,
+                    page_filter=page_filter,
+                    page_range=page_range,
+                    source_hint=source_hint,
+                )
+            )
+        lex_nodes = _hits_to_nodes(lexical_hits)
+        return semantic_nodes, lex_nodes, 0, []
+
+    def _retrieve_page_nodes(
+        self,
+        expanded: str,
+        plan: QueryPlan,
+        profile: Any,
+    ) -> list[NodeWithScore]:
+        page_nodes: list[NodeWithScore] = []
+        if not self.page_index or (not plan.requested_page and not plan.requested_page_range):
+            return page_nodes
+        for ph in self.page_index.search(
+            expanded,
+            limit=min(12, profile.reranker_candidate_k),
+            page_filter=plan.requested_page,
+            page_range=plan.requested_page_range,
+            source_hint=plan.requested_source_hint,
+        ):
+            node = TextNode(
+                text=ph.text,
+                metadata={
+                    "source_file": ph.source_file,
+                    "page": ph.page,
+                    "page_level": True,
+                    "doc_type": ph.doc_type,
+                    "doc_number": ph.doc_number,
+                },
+            )
+            page_nodes.append(NodeWithScore(node=node, score=ph.score + 0.05))
+        return page_nodes
+
+    def _apply_section_boost(
+        self, nodes: list[NodeWithScore], section_markers: tuple[str, ...]
+    ) -> None:
+        if not section_markers:
+            return
+        for item in nodes:
+            body = item.node.get_content(metadata_mode=MetadataMode.NONE).lower()
+            if any(marker in body for marker in section_markers):
+                item.score = float(item.score or 0.0) + 0.15
+
+    def _fuse_and_diversify(
+        self,
+        semantic_nodes: list[NodeWithScore],
+        lex_nodes: list[NodeWithScore],
+        page_nodes: list[NodeWithScore],
+        profile: Any,
+    ) -> list[NodeWithScore]:
+        ranked_lists = [semantic_nodes, lex_nodes]
+        if page_nodes:
+            ranked_lists.append(page_nodes)
+        fused_map = _rrf_fuse(ranked_lists, _key_of)
+        fused_nodes = sorted(
+            fused_map.values(), key=lambda n: float(n.score or 0.0), reverse=True
+        )
+        return _diversify_nodes(fused_nodes, profile.reranker_candidate_k)
+
+    def _apply_graph_expansion(
+        self, fused_nodes: list[NodeWithScore], profile: Any
+    ) -> tuple[list[NodeWithScore], int]:
+        graph_expansion_count = 0
+        if not self.project_id:
+            return fused_nodes, graph_expansion_count
+        graph = load_graph(self.project_id)
+        if not graph:
+            return fused_nodes, graph_expansion_count
+
+        related_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for seed in _seed_ref_keys(fused_nodes):
+            parsed_seed = _parse_ref_key(seed)
+            if parsed_seed and parsed_seed not in seen_pairs:
+                seen_pairs.add(parsed_seed)
+                related_pairs.append(parsed_seed)
+            entry = graph.get(seed) or {}
+            for related in entry.get("references") or []:
+                parsed = _parse_ref_key(str(related))
+                if parsed and parsed not in seen_pairs:
+                    seen_pairs.add(parsed)
+                    related_pairs.append(parsed)
+
+        extra_hits = self.lexical_index.search_by_doc_refs(
+            related_pairs,
+            limit=max(4, profile.reranker_top_n // 2),
+        )
+        extra_nodes = _hits_to_nodes(extra_hits)
+        if not extra_nodes:
+            return fused_nodes, graph_expansion_count
+
+        existing_keys = {_key_of(item) for item in fused_nodes}
+        for item in extra_nodes:
+            key = _key_of(item)
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            item.score = float(item.score or 0.0) + 0.03
+            fused_nodes.append(item)
+
+        fused_nodes = sorted(
+            fused_nodes, key=lambda n: float(n.score or 0.0), reverse=True
+        )
+        fused_nodes = _diversify_nodes(fused_nodes, profile.reranker_candidate_k)
+        return fused_nodes, len(extra_nodes)

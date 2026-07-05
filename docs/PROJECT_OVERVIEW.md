@@ -8,7 +8,7 @@ Documento de referência sobre **o que o sistema é**, **como opera** e **quais 
 
 **PDF Extreme AI** é um assistente para **autos e PDFs jurídicos** que combina:
 
-- Interface web em **Streamlit**;
+- Interface web principal em **React + FastAPI**, com UI **Streamlit** legada (`legacy/app.py`);
 - **RAG** (Retrieval-Augmented Generation) híbrido: busca semântica (vetores) + busca lexical (FTS5);
 - LLM local via **Ollama** (modelos `gemma4:26b` e `gemma4:e4b`);
 - Reranker **BGE** (cross-encoder) para refinar trechos antes da resposta;
@@ -24,14 +24,14 @@ O sistema foi desenhado para perícia e análise processual: citações por pág
 
 | Camada | Tecnologia |
 |--------|------------|
-| UI | Streamlit (`app.py`) |
+| UI | React + FastAPI (principal); Streamlit (`legacy/app.py`) legado |
 | Orquestração RAG | LlamaIndex (`CondensePlusContextChatEngine`, `VectorStoreIndex`) |
 | Vetores | Qdrant + embeddings **BGE-M3** (HuggingFace) |
 | Lexical | SQLite **FTS5** (`lexical_fts`, `page_fts`) |
 | LLM | Ollama (`OllamaThinkingStream` com suporte a *thinking*) |
 | Reranker | `BAAI/bge-reranker-base` (CPU ou CUDA) |
 | PDF | PyMuPDF / pypdf; OCR opcional (Tesseract) |
-| Persistência | `projects_registry.json`, `projects_data/`, checkpoints de ingest |
+| Persistência | `data/projects_registry.json`, `data/projects/<project_id>/`, `data/checkpoints/<project_id>.json` |
 
 ---
 
@@ -285,25 +285,32 @@ Na UI: expander **Thinking do modelo** (recolhido após a resposta).
 
 ```
 pdf_extreme_ai/
-├── projects_registry.json          # Lista de projetos
-├── projects_data/
-│   └── <project_id>/
-│       ├── uploads/                  # PDFs enviados
-│       ├── conversations/            # <id>.json — histórico de chat
-│       ├── project_memory.md         # Memória narrativa do caso
-│       ├── project_memory.json       # Memória estruturada (opcional)
-│       └── entities.json             # Entidades extraídas na ingest
-├── .lexical_<project_id>.db          # SQLite FTS (chunks + pages)
-├── .ingest_checkpoint_<project_id>.json
-├── qdrant_data/                      # Volume Docker Qdrant
-└── .env                              # Configuração local
+├── data/
+│   ├── projects_registry.json          # Lista de projetos
+│   ├── projects/
+│   │   └── <project_id>/
+│   │       ├── uploads/                  # PDFs enviados
+│   │       ├── conversations/            # <id>.json — histórico de chat
+│   │       ├── project_memory.md         # Memória narrativa do caso
+│   │       ├── project_memory.json       # Memória estruturada (opcional)
+│   │       ├── entities.json             # Entidades extraídas na ingest
+│   │       └── cross_doc_graph.json      # Grafo de referências cruzadas
+│   ├── lexical/
+│   │   └── <project_id>.db               # SQLite FTS (chunks + pages)
+│   ├── checkpoints/
+│   │   └── <project_id>.json             # Checkpoint de ingest
+│   └── auth/
+│       ├── admins.json                   # Administradores
+│       └── usuarios_app.json             # Consultores e hashes
+├── qdrant_data/                          # Volume Docker Qdrant
+└── .env                                  # Configuração local
 ```
 
 Cada **projeto** tem:
 
 - `qdrant_collection` (ex.: `proj_meu_caso`);
-- `lexical_db_path` (ex.: `.lexical_meu-caso.db`);
-- `checkpoint_path` para retomar ingest.
+- `lexical_db_path` (ex.: `data/lexical/meus-projeto.db`);
+- `checkpoint_path` (ex.: `data/checkpoints/meus-projeto.json`) para retomar ingest.
 
 ---
 
@@ -314,13 +321,28 @@ Cada **projeto** tem:
 | **Regras globais do projeto** | Painel esquerdo → `ProjectRecord.global_rules` | Injetadas nos prompts (prioridade alta no chat livre) |
 | **Memória do caso** | `project_memory.md` + opcional `project_memory.json` | Contexto narrativo; no RAG, documentos prevalecem em conflito |
 | **Histórico da conversa** | `Memory` LlamaIndex + JSON salvo | Condensação de follow-ups; limite `CHAT_MEMORY_TOKEN_LIMIT` |
-| **Session Streamlit** | `st.session_state` | Mensagens, modo ativo, ingest, modelo |
+| **Session React** | React state + query params + `localStorage` | Mensagens, projeto/conversa ativos, modo, modelo |
+| **Session Streamlit (legado)** | `st.session_state` | Mensagens, modo ativo, ingest, modelo |
 
 ---
 
-## 12. UI Streamlit (layout)
+## 12. UI (layout)
 
-### Painel esquerdo (sidebar)
+A interface principal é a SPA React (`frontend/`). A UI Streamlit em `legacy/app.py` permanece funcional, mas está em transição.
+
+### React (principal)
+
+- **Sidebar (`UnifiedSidebar`)**: seleção/criação de **projeto**, lista de **conversas**, upload de PDFs.
+- **Painel central (`MainWorkspace`)**:
+  - Seletor de **modo** (RAG / Chat livre / Corretor)
+  - Área de **chat** (`ChatPanel`) ou corretor (`ProofreadPanel`)
+  - `DocumentsPanel` no modo RAG
+- **Drawer de config (`ConfigDrawer`)**: regras globais e memória do caso.
+- **Telemetria**: por resposta, exibe thinking, trechos recuperados e exportação Markdown.
+
+### Streamlit (legado)
+
+#### Painel esquerdo (sidebar)
 
 - Seleção / criação de **projeto**
 - Upload e **ingestão** de PDFs (auto-ingest ou manual)
@@ -330,7 +352,7 @@ Cada **projeto** tem:
 - **Timeline / entidades** (após ingest)
 - Alertas de **qualidade** de extração
 
-### Painel direito
+#### Painel direito
 
 - Seletor de **modelo** Ollama
 - **Modo de uso** (RAG / Chat livre / Corretor)

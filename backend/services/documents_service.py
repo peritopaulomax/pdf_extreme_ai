@@ -66,3 +66,5 @@ def validate_upload_batch(files, settings) -> None:
             )
         if not (name.lower().endswith(".pdf")):
             raise HTTPException(400, detail=f"'{name}' nao e PDF.")
+        if not payload.startswith(b"%PDF-"):
+            raise HTTPException(400, detail=f"'{name}' nao possui assinatura PDF valida.")

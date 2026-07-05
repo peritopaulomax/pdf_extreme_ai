@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from auth.passwords import hash_senha, verificar_hash
 
@@ -31,12 +34,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@contextmanager
+def _file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+_AUTH_THREAD_LOCK = threading.Lock()
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=True, indent=2),
-        encoding="utf-8",
-    )
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with _AUTH_THREAD_LOCK:
+        with _file_lock(lock_path):
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(data, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, path)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -56,11 +78,20 @@ def ensure_auth_dir() -> Path:
 # --- admins.json ---
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with _AUTH_THREAD_LOCK:
+        with _file_lock(lock_path):
+            return json.loads(path.read_text(encoding="utf-8"))
+
+
 def carregar_admins() -> list[str]:
     path = _admins_path()
     if not path.exists():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = _read_json(path)
     admins = data.get("administradores") or []
     return [str(a).strip().lower() for a in admins if str(a).strip()]
 
@@ -89,7 +120,7 @@ def _load_usuarios_doc() -> dict[str, Any]:
     path = _usuarios_path()
     if not path.exists():
         return {"usuarios": {}, "consultores": [], "ultima_atualizacao": _now_iso()}
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = _read_json(path)
     if "usuarios" not in data or not isinstance(data["usuarios"], dict):
         data["usuarios"] = {}
     if "consultores" not in data or not isinstance(data["consultores"], list):

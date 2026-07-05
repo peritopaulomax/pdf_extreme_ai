@@ -43,7 +43,6 @@ export async function checkPrimeiroAcesso(usuario: string) {
   return apiFetch<{
     autorizado: boolean;
     tem_senha: boolean;
-    perfil_previsto: string | null;
   }>(`/auth/primeiro-acesso/check?usuario=${q}`, { skipAuthRedirect: true });
 }
 

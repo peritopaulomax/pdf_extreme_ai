@@ -66,7 +66,7 @@ Conversa: campo opcional `active_turn_id` (string ou null).
 
 ## Feature flag
 
-- Env: `CHAT_ASYNC_TURNS=true|false` (default `false` em testes legados).
+- Env: `CHAT_ASYNC_TURNS=true|false`. Ausência ou valor diferente de `1`/`true`/`yes` é interpretado como `false`; este é o comportamento atual tanto na API v2 quanto nos testes legados.
 
 ## Edge cases
 

@@ -7,17 +7,18 @@ Mapeamento entre a UI Streamlit atual (`pdf_extreme_ai/app.py`) e a API FastAPI 
 
 ## 1. Paths e dados compartilhados
 
-| Recurso | Path relativo ao repo pai (`pdf_extreme_ai/`) | Escopo |
-|---------|-----------------------------------------------|--------|
-| Registry de projetos | `projects_registry.json` | Global |
-| Dados por projeto | `projects_data/<project_id>/` | Por projeto |
-| Uploads PDF | `projects_data/<project_id>/uploads/` | Por projeto |
-| Conversas | `projects_data/<project_id>/conversations/<id>.json` | Por projeto |
-| Memória do caso | `projects_data/<project_id>/project_memory.md` | Por projeto |
-| Memória estruturada | `projects_data/<project_id>/project_memory.json` | Por projeto |
-| Entidades NER | `projects_data/<project_id>/entities.json` | Por projeto |
-| Índice lexical | `.lexical_<project_id>.db` (cwd do processo) | Por projeto |
-| Checkpoint ingest | `.ingest_checkpoint_<project_id>.json` | Por projeto |
+| Recurso | Path relativo ao repo (`pdf_extreme_ai/`) | Escopo |
+|---------|--------------------------------------------|--------|
+| Registry de projetos | `data/projects_registry.json` | Global |
+| Dados por projeto | `data/projects/<project_id>/` | Por projeto |
+| Uploads PDF | `data/projects/<project_id>/uploads/` | Por projeto |
+| Conversas | `data/projects/<project_id>/conversations/<id>.json` | Por projeto |
+| Memória do caso | `data/projects/<project_id>/project_memory.md` | Por projeto |
+| Memória estruturada | `data/projects/<project_id>/project_memory.json` | Por projeto |
+| Entidades NER | `data/projects/<project_id>/entities.json` | Por projeto |
+| Grafo cross-doc | `data/projects/<project_id>/cross_doc_graph.json` | Por projeto |
+| Índice lexical | `data/lexical/<project_id>.db` | Por projeto |
+| Checkpoint ingest | `data/checkpoints/<project_id>.json` | Por projeto |
 | Qdrant collection | `proj_<project_id>` (nome em `ProjectRecord`) | Por projeto |
 | Qdrant storage | `qdrant_data/` (Docker volume) | Global |
 | `.env` | `pdf_extreme_ai/.env` | Config |
@@ -88,7 +89,7 @@ Mapeamento entre a UI Streamlit atual (`pdf_extreme_ai/app.py`) e a API FastAPI 
 | Timeline entidades | `load_entities` | `GET /projects/{id}/entities` | Aba Memória / Timeline |
 | Forçar OCR | `ENABLE_OCR` env temporário | `POST ingest?force_ocr=true` | Fase 2 |
 
-**Nota:** `ProjectStore.delete_project` é chamado em `app.py` mas **não está definido** no `project_store.py` atual — possível bug Streamlit. A API v2 implementa delete via remoção no registry + `_cleanup_project_assets` (lógica copiada para `backend/services/project_cleanup.py`).
+**Nota:** `ProjectStore.delete_project` foi adicionado ao `core/project_store.py` e é usado tanto pela API v2 quanto pela UI Streamlit. A lógica de cleanup de assets (Qdrant, SQLite, uploads) permanece em `backend/services/project_cleanup.py`.
 
 ---
 

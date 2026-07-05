@@ -41,7 +41,7 @@ export RERANKER_DEVICE=cpu
 
 ### Uso simultaneo (varias abas / usuarios)
 
-- Um unico processo `streamlit run app.py` compartilha GPU e cache de modelos.
+- O backend FastAPI (`uvicorn main:app`) e o frontend React (`npm run dev` / build estático) compartilham GPU e cache de modelos via processo do backend.
 - Apenas **uma ingestao por vez** na GPU; outras abas veem o chat bloqueado ate terminar.
 - Salvar regras do projeto **nao** recarrega modelos na GPU.
 - Ruído `torchvision` no terminal (file watcher): opcional `streamlit run app.py --server.fileWatcherType poll`.
@@ -64,7 +64,7 @@ streamlit run app.py --server.fileWatcherType poll
 
 ### 4.1) Projetos e fontes (painel esquerdo)
 
-Criar/selecionar projeto, upload de PDFs, logs de ingestao, explorer de documentos, regras globais, **memoria do caso** (`projects_data/<project_id>/project_memory.md`), exclusao de projeto.
+Criar/selecionar projeto, upload de PDFs, logs de ingestao, explorer de documentos, regras globais, **memoria do caso** (`data/projects/<project_id>/project_memory.md`), exclusao de projeto.
 
 ### 4.2) Tres modos de uso (painel direito)
 
@@ -83,7 +83,7 @@ Seletor **Modo de uso**, independente de haver PDFs no projeto:
 
 ### 4.3) Conversas (painel direito)
 
-- Arquivos: `projects_data/<project_id>/conversations/<conversation_id>.json`
+- Arquivos: `data/projects/<project_id>/conversations/<conversation_id>.json`
 - **Historico salvo** + **Abrir** carrega mensagens na UI e **reidrata** a memoria do engine (o modelo volta a ver o fio da conversa ate o limite `CHAT_MEMORY_TOKEN_LIMIT`).
 - Se a pagina Streamlit for recarregada com mensagens ja na sessao, a memoria e sincronizada automaticamente quando vazia.
 - **Thinking do modelo**: expander recolhido apos cada resposta (quando `OLLAMA_THINKING=true` e o modelo suporta `think`).

@@ -10,6 +10,8 @@ Criar uma suíte TDD que:
 2. importe o engine legado real quando necessário para garantir paridade comportamental;
 3. deixe testes vermelhos para as features ainda não implementadas, servindo de trilha para o desenvolvimento incremental.
 
+> **Nota:** várias features listadas abaixo (A–L) já estão implementadas no motor atual (`multi_query`, `cross_doc_graph`, diversificação RRF, etc.). O plano deve ser revisado para marcar essas features como concluídas e manter vermelhos apenas os testes de funcionalidades futuras.
+
 ## Escopo
 
 O escopo desta suíte é deliberadamente duplo:

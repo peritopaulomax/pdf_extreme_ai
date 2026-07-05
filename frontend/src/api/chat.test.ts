@@ -49,7 +49,7 @@ describe("streamChat", () => {
     );
 
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(onStatus).toHaveBeenCalledWith("Buscando");
+    expect(onStatus).toHaveBeenCalledWith("Buscando", { message: "Buscando" });
     expect(onThinking).toHaveBeenCalledWith("Raciocinando");
     expect(onToken).toHaveBeenCalledWith("Olá");
     expect(onMeta).toHaveBeenCalledWith({

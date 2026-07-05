@@ -7,10 +7,52 @@
     "expect_literal": true
   },
   {
+    "id": "literal_02",
+    "project_id": "demo",
+    "question": "Quais documentos mencionam o CPF 123.456.789-00?",
+    "expect_citation": true,
+    "expect_literal": true
+  },
+  {
     "id": "page_01",
     "project_id": "demo",
     "question": "O que consta na pagina 5 do laudo?",
     "expect_citation": true,
     "requested_page": 5
+  },
+  {
+    "id": "page_02",
+    "project_id": "demo",
+    "question": "Resuma o conteudo das paginas 10 a 12 do parecer tecnico.",
+    "expect_citation": true,
+    "requested_page_range": [10, 12]
+  },
+  {
+    "id": "analytical_01",
+    "project_id": "demo",
+    "question": "Qual a cronologia dos fatos apresentados nos autos?",
+    "expect_citation": true,
+    "expect_summary": true
+  },
+  {
+    "id": "analytical_02",
+    "project_id": "demo",
+    "question": "Quem sao as partes envolvidas neste processo?",
+    "expect_citation": true,
+    "expect_entities": true
+  },
+  {
+    "id": "negative_01",
+    "project_id": "demo",
+    "question": "O autos mencionam alienigenas?",
+    "expect_citation": false,
+    "expect_negative": true
+  },
+  {
+    "id": "audit_01",
+    "project_id": "demo",
+    "question": "Liste todas as ocorrencias do termo 'contrato' nos documentos.",
+    "expect_citation": true,
+    "expect_exhaustive": true
   }
 ]

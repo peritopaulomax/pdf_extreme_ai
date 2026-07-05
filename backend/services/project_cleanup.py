@@ -56,20 +56,5 @@ def cleanup_project_assets(settings, project) -> dict:
 
 
 def delete_project_from_registry(store, project_id: str):
-    """Remove projeto do registry (delete_project ausente no store legado)."""
-    data = store._load()
-    projects = data.get("projects") or []
-    removed = None
-    kept = []
-    for item in projects:
-        if str(item.get("project_id")) == project_id:
-            removed = item
-        else:
-            kept.append(item)
-    if removed is None:
-        raise RuntimeError(f"Projeto nao encontrado: {project_id}")
-    data["projects"] = kept
-    store._save(data)
-    from project_store import ProjectRecord
-
-    return ProjectRecord(**removed)
+    """Remove projeto do registry usando a API publica do ProjectStore."""
+    return store.delete_project(project_id)

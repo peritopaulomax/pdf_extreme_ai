@@ -37,7 +37,7 @@ flowchart TD
 
 ```bash
 cd pdf_extreme_ai_v2
-cp .env.example .env   # editar SESSION_SECRET, BOOTSTRAP_ADMIN_USER
+cp .env.example .env   # editar SESSION_SECRET
 python scripts/bootstrap_admin.py seu.usuario
 cd backend && pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8765 --reload

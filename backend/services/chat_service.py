@@ -434,46 +434,73 @@ def _recover_empty_content(
     )
 
 
-def run_chat_turn(
+
+@dataclass
+class _ChatTurnState:
+    """Estado mutável compartilhado durante um turno de chat."""
+
+    project_id: str
+    conversation_id: str | None
+    prompt: str
+    model_name: str
+    workspace: str
+    profile: str | None
+    audit_mode: bool
+    use_project_memory: bool
+    session_rules: str
+    create_conversation: bool
+    turn_id: str | None
+    stack: Any
+    runtime_settings: Any
+    rec: Any
+    prior_messages: list[dict]
+    stream_stats: StreamStats
+    memory: Any
+    project_memory: str
+    chat_engine: Any
+    fallback_chat_engine: Any | None
+    hybrid_retriever: Any
+    assistant_text: str = ""
+    thinking_text: str | None = None
+    used_fallback: bool = False
+    stream_interrupted: bool = False
+    interruption_reason: str | None = None
+    stream_error_message: str | None = None
+    telemetry: str | None = None
+    retrieved_chunks: list[dict] = field(default_factory=list)
+    effective_prompt: str = ""
+    use_audit_synthesis: bool = False
+    use_analytical_synthesis: bool = False
+    diagnostics: Any = None
+    validation: Any = None
+
+
+def _load_turn_state(
     *,
     project_id: str,
     conversation_id: str | None,
     message: str,
     model: str,
     workspace: str,
-    profile: str | None = None,
-    audit_mode: bool = False,
-    use_project_memory: bool = True,
-    session_rules: str = "",
-    create_conversation: bool = False,
-    turn_id: str | None = None,
-) -> Iterator[str]:
-    """Generator de linhas SSE para um turno de chat."""
+    profile: str | None,
+    audit_mode: bool,
+    use_project_memory: bool,
+    session_rules: str,
+    create_conversation: bool,
+    turn_id: str | None,
+) -> _ChatTurnState:
+    """Carrega conversa, stack, memória e engines."""
     bootstrap_legacy()
     import conversation_store as conv_store
-    from analytical_synthesis import run_analytical_synthesis, should_run_analytical_synthesis
     from case_memory import enrich_project_memory
     import project_memory as project_memory_store
-    from app_workspace import chat_mode_for_workspace, should_run_audit_synthesis
-    from audit_synthesis import run_audit_synthesis
-    from answer_validator import build_retry_prompt, validate_answer
+    from app_workspace import chat_mode_for_workspace
     from chat_memory import rehydrate_memory_from_messages, sync_memory_with_session
-    from chat_response_utils import coalesce_assistant_reply, is_empty_llm_output
-    from exhaustive_retrieval import format_audit_context, search_exhaustive
     from llama_index.core.memory import Memory
-    from llama_index.core.schema import QueryBundle
-    from llm_thinking import clear_captured_thinking, get_captured_thinking
-    from query_expansion import expand_query
-    from query_planner import plan_query
-    from retrieved_chunks_ui import nodes_to_serializable
     from retrieval_pipeline import HybridRetriever
     from runtime_config import configure_runtime_env
 
     prompt = _normalize_user_prompt(message or "")
-    if not prompt:
-        yield format_sse("error", {"message": "Mensagem vazia."})
-        return
-
     settings = configure_runtime_env()
     forced_profile = _resolve_forced_profile(profile)
     chat_mode = chat_mode_for_workspace("rag" if workspace == "rag" else "free")
@@ -498,6 +525,8 @@ def run_chat_turn(
             title="Nova conversa",
             model_name=model_name,
         )
+        if create_conversation and conversation_id:
+            rec.conversation_id = conversation_id
     elif create_conversation and not rec.messages:
         pass
 
@@ -552,372 +581,834 @@ def run_chat_turn(
     if repeat_question and hasattr(chat_engine, "_skip_condense"):
         chat_engine._skip_condense = True
         stream_stats.skip_condense = True
+
+    hybrid_retriever = stack.hybrid_retriever
+
+    return _ChatTurnState(
+        project_id=project_id,
+        conversation_id=conversation_id,
+        prompt=prompt,
+        model_name=model_name,
+        workspace=workspace,
+        profile=profile,
+        audit_mode=audit_mode,
+        use_project_memory=use_project_memory,
+        session_rules=session_rules,
+        create_conversation=create_conversation,
+        turn_id=turn_id,
+        stack=stack,
+        runtime_settings=runtime_settings,
+        rec=rec,
+        prior_messages=prior_messages,
+        stream_stats=stream_stats,
+        memory=memory,
+        project_memory=pm,
+        chat_engine=chat_engine,
+        fallback_chat_engine=fallback_chat_engine,
+        hybrid_retriever=hybrid_retriever,
+        effective_prompt=prompt,
+    )
+
+
+def _run_audit_synthesis(state: _ChatTurnState) -> Iterator[str]:
+    """Executa síntese de auditoria quando a intenção exige varredura exaustiva."""
+    from llama_index.core.schema import QueryBundle
+    from query_expansion import expand_query
+    from audit_synthesis import run_audit_synthesis
+    from exhaustive_retrieval import format_audit_context, search_exhaustive
+    from query_planner import plan_query
+
+    hybrid_retriever = state.hybrid_retriever
+    runtime_settings = state.runtime_settings
+    effective_prompt = state.effective_prompt
+    model_name = state.model_name
+
+    plan_pre = plan_query(
+        effective_prompt, runtime_settings, forced_profile=_resolve_forced_profile(state.profile)
+    )
+    expanded = expand_query(
+        effective_prompt,
+        project_memory=getattr(hybrid_retriever, "project_memory", ""),
+        intent="auditoria_exaustiva",
+    )
+    _, audit_pages = search_exhaustive(
+        hybrid_retriever.lexical_index,
+        expanded,
+        batch_size=runtime_settings.exhaustive_batch_size,
+        max_total=runtime_settings.exhaustive_max_hits,
+        page_filter=plan_pre.requested_page,
+        page_range=plan_pre.requested_page_range,
+        source_hint=plan_pre.requested_source_hint,
+    )
+    if len(audit_pages) >= runtime_settings.audit_map_reduce_threshold:
+        state.use_audit_synthesis = True
+        yield format_sse(
+            "status",
+            {
+                "message": f"Modo auditoria: {len(audit_pages)} paginas, sintese em lotes..."
+            },
+        )
+
+        def _audit_progress(i: int, total: int, phase: str) -> None:
+            pass
+
+        if _model_generation_is_busy(model_name):
+            yield format_sse(
+                "status",
+                {
+                    "message": (
+                        f"Modelo {model_name} ocupado; pergunta na fila "
+                        "aguardando a geracao anterior terminar..."
+                    )
+                },
+            )
+        lease = _acquire_model_generation_slot(model_name)
+        try:
+            state.assistant_text = run_audit_synthesis(
+                state.stack.capture_llm.llm,
+                effective_prompt,
+                audit_pages,
+                pages_per_batch=runtime_settings.audit_pages_per_batch,
+                progress_callback=_audit_progress,
+            )
+        finally:
+            _release_model_generation_slot(lease)
+        if state.assistant_text:
+            yield format_sse("token", {"text": state.assistant_text})
+        hybrid_retriever.retrieve(QueryBundle(query_str=expanded))
+    elif audit_pages:
+        state.effective_prompt = (
+            f"{effective_prompt}\n\n[Contexto varredura lexical]\n"
+            f"{format_audit_context(audit_pages)}"
+        )
+
+
+def _run_analytical_synthesis(state: _ChatTurnState) -> Iterator[str]:
+    """Executa síntese analítica em modo map-reduce sobre chunks recuperados."""
+    from llama_index.core.schema import QueryBundle
+    from analytical_synthesis import run_analytical_synthesis, should_run_analytical_synthesis
+    from query_planner import plan_query
+    from retrieved_chunks_ui import nodes_to_serializable
+
+    hybrid_retriever = state.hybrid_retriever
+    runtime_settings = state.runtime_settings
+    effective_prompt = state.effective_prompt
+    model_name = state.model_name
+    forced_profile = _resolve_forced_profile(state.profile)
+
+    plan_pre = plan_query(effective_prompt, runtime_settings, forced_profile=forced_profile)
+    if not should_run_analytical_synthesis(
+        effective_prompt,
+        plan_pre,
+        enabled=getattr(runtime_settings, "analytical_map_reduce_enabled", False),
+    ):
+        return
+
+    prior_profile = getattr(hybrid_retriever, "forced_profile", None)
+    if forced_profile is None and plan_pre.profile != "pericial":
+        hybrid_retriever.forced_profile = "pericial"
+    fused_nodes = hybrid_retriever.retrieve(QueryBundle(query_str=effective_prompt))
+    if prior_profile is not None:
+        hybrid_retriever.forced_profile = prior_profile
+    elif forced_profile is None:
+        hybrid_retriever.forced_profile = None
+
+    if len(fused_nodes) >= getattr(runtime_settings, "analytical_map_reduce_min_chunks", 10):
+        state.use_analytical_synthesis = True
+        yield format_sse(
+            "status",
+            {
+                "message": (
+                    f"Modo analitico: {len(fused_nodes)} trechos, "
+                    "sintese em lotes..."
+                )
+            },
+        )
+        lease = _acquire_model_generation_slot(model_name)
+        try:
+            state.assistant_text = run_analytical_synthesis(
+                state.stack.capture_llm.llm,
+                effective_prompt,
+                fused_nodes,
+                chunks_per_batch=getattr(runtime_settings, "analytical_chunks_per_batch", 5),
+                max_batches=getattr(runtime_settings, "analytical_max_batches", 6),
+            )
+        finally:
+            _release_model_generation_slot(lease)
+        if state.assistant_text:
+            yield format_sse("token", {"text": state.assistant_text})
+        state.retrieved_chunks = nodes_to_serializable(fused_nodes)
+
+
+def _stream_response_from_engine(
+    state: _ChatTurnState,
+    chat_engine,
+    prompt: str,
+    *,
+    label_prefix: str,
+) -> Iterator[str]:
+    """Faz streaming de uma resposta a partir de um chat_engine."""
+    from chat_response_utils import coalesce_assistant_reply, is_empty_llm_output
+    from llm_thinking import clear_captured_thinking, get_captured_thinking
+
+    runtime_settings = state.runtime_settings
+    model_name = state.model_name
+    stream_stats = state.stream_stats
+    capture_llm = state.stack.capture_llm
+
+    start_timeout_s = float(
+        getattr(runtime_settings, "chat_stream_start_timeout_s", _STREAM_START_TIMEOUT_S)
+    )
+    queued = _model_generation_is_busy(model_name)
+    if queued:
+        yield format_sse(
+            "status",
+            {
+                "message": (
+                    f"Modelo {model_name} ocupado; {label_prefix} na fila "
+                    "aguardando a geracao anterior terminar..."
+                )
+            },
+        )
+    stream_resp = _call_with_timeout(
+        lambda: chat_engine.stream_chat(prompt),
+        timeout_s=start_timeout_s,
+        label=f"{label_prefix}_stream_start",
+    )
+    if queued:
+        yield format_sse(
+            "status",
+            {"message": "Modelo liberado; iniciando resposta..."},
+        )
+
+    gen = getattr(stream_resp, "response_gen", None)
+    if gen is not None:
+        idle_timeout_s = float(
+            getattr(runtime_settings, "chat_stream_idle_timeout_s", _STREAM_IDLE_TIMEOUT_S)
+        )
+        for piece, think_snap in _stream_tokens_with_idle_timeout(
+            gen,
+            capture_llm,
+            idle_timeout_s=idle_timeout_s,
+            stats=stream_stats,
+        ):
+            if think_snap:
+                state.thinking_text = think_snap
+                yield format_sse("thinking", {"text": think_snap})
+            if piece:
+                state.assistant_text += piece
+                yield format_sse("token", {"text": piece})
+        state.assistant_text = coalesce_assistant_reply(
+            state.assistant_text,
+            stream_resp,
+            chat_engine,
+        )
+        if is_empty_llm_output(state.assistant_text):
+            recovered, recovered_thinking = _sync_chat_reply(
+                chat_engine,
+                prompt,
+                capture_llm,
+            )
+            if not is_empty_llm_output(recovered):
+                state.assistant_text = recovered
+                if recovered_thinking:
+                    state.thinking_text = recovered_thinking
+                yield format_sse("token", {"text": state.assistant_text})
+            elif stream_stats.thinking_updates > 0:
+                yield format_sse(
+                    "status",
+                    {
+                        "message": (
+                            "Modelo retornou apenas raciocinio; "
+                            "repetindo geracao sem thinking..."
+                        )
+                    },
+                )
+                recovered, recovered_thinking = _recover_empty_content(
+                    chat_engine,
+                    prompt,
+                    capture_llm,
+                    stream_stats,
+                )
+                if not is_empty_llm_output(recovered):
+                    state.assistant_text = recovered
+                    if recovered_thinking:
+                        state.thinking_text = recovered_thinking
+                    yield format_sse("token", {"text": state.assistant_text})
+    else:
+        state.assistant_text = coalesce_assistant_reply(
+            getattr(stream_resp, "response", "") or "",
+            stream_resp,
+            chat_engine,
+        )
+        if state.assistant_text:
+            yield format_sse("token", {"text": state.assistant_text})
+        state.thinking_text = get_captured_thinking(capture_llm) or _extract_thinking(
+            stream_resp
+        )
+        if state.thinking_text:
+            yield format_sse("thinking", {"text": state.thinking_text})
+
+    state.thinking_text = (
+        state.thinking_text
+        or get_captured_thinking(capture_llm)
+        or _extract_thinking(stream_resp)
+    )
+    if is_empty_llm_output(state.assistant_text):
+        recovered, recovered_thinking = _sync_chat_reply(
+            chat_engine,
+            prompt,
+            capture_llm,
+        )
+        if not is_empty_llm_output(recovered):
+            state.assistant_text = recovered
+            if recovered_thinking:
+                state.thinking_text = recovered_thinking
+            yield format_sse("token", {"text": state.assistant_text})
+        elif stream_stats.thinking_updates > 0 or (
+            state.thinking_text and not state.assistant_text
+        ):
+            yield format_sse(
+                "status",
+                {
+                    "message": (
+                        "Modelo retornou apenas raciocinio; "
+                        "repetindo geracao sem thinking..."
+                    )
+                },
+            )
+            recovered, recovered_thinking = _recover_empty_content(
+                chat_engine,
+                prompt,
+                capture_llm,
+                stream_stats,
+            )
+            if not is_empty_llm_output(recovered):
+                state.assistant_text = recovered
+                if recovered_thinking:
+                    state.thinking_text = recovered_thinking
+                yield format_sse("token", {"text": state.assistant_text})
+
+
+def _run_fallback_response(state: _ChatTurnState, exc: Exception) -> Iterator[str]:
+    """Tenta responder sem reranker quando ele falha."""
+    from chat_response_utils import coalesce_assistant_reply, is_empty_llm_output
+    from llm_thinking import clear_captured_thinking, get_captured_thinking
+
+    fallback_chat_engine = state.fallback_chat_engine
+    if fallback_chat_engine is None:
+        raise exc
+
+    state.used_fallback = True
+    yield format_sse("status", {"message": "Reranker falhou; respondendo sem reranker."})
+
+    runtime_settings = state.runtime_settings
+    model_name = state.model_name
+    stream_stats = state.stream_stats
+    capture_llm = state.stack.capture_llm
+    prompt = state.prompt
+
+    try:
+        clear_captured_thinking(capture_llm)
+        start_timeout_s = float(
+            getattr(runtime_settings, "chat_stream_start_timeout_s", _STREAM_START_TIMEOUT_S)
+        )
+        queued = _model_generation_is_busy(model_name)
+        if queued:
+            yield format_sse(
+                "status",
+                {
+                    "message": (
+                        f"Modelo {model_name} ocupado; fallback na fila "
+                        "aguardando a geracao anterior terminar..."
+                    )
+                },
+            )
+        stream_fb = _call_with_timeout(
+            lambda: fallback_chat_engine.stream_chat(prompt),
+            timeout_s=start_timeout_s,
+            label="fallback_stream_start",
+        )
+        if queued:
+            yield format_sse(
+                "status",
+                {"message": "Modelo liberado; iniciando fallback..."},
+            )
+        gen_fb = getattr(stream_fb, "response_gen", None)
+        state.assistant_text = ""
+        if gen_fb is not None:
+            idle_timeout_s = float(
+                getattr(runtime_settings, "chat_stream_idle_timeout_s", _STREAM_IDLE_TIMEOUT_S)
+            )
+            for piece, think_snap in _stream_tokens_with_idle_timeout(
+                gen_fb,
+                capture_llm,
+                idle_timeout_s=idle_timeout_s,
+                stats=stream_stats,
+            ):
+                if think_snap:
+                    state.thinking_text = think_snap
+                    yield format_sse("thinking", {"text": think_snap})
+                if piece:
+                    state.assistant_text += piece
+                    yield format_sse("token", {"text": piece})
+            if not state.assistant_text:
+                state.assistant_text = (
+                    getattr(stream_fb, "response", None)
+                    or getattr(stream_fb, "unformatted_response", None)
+                    or ""
+                )
+        else:
+            state.assistant_text = getattr(stream_fb, "response", "") or ""
+            if state.assistant_text:
+                yield format_sse("token", {"text": state.assistant_text})
+            state.thinking_text = get_captured_thinking(
+                capture_llm
+            ) or _extract_thinking(stream_fb)
+    except Exception as exc_fb:
+        state.stream_error_message = f"Falha no fallback: {exc_fb}"
+        state.stream_interrupted = True
+        state.interruption_reason = state.stream_error_message
+
+
+def _run_retry(state: _ChatTurnState, validation) -> Iterator[str]:
+    """Executa retry automático via fallback_engine quando a validação pede."""
+    from answer_validator import build_retry_prompt
+    from chat_response_utils import coalesce_assistant_reply, is_empty_llm_output
+    from llm_thinking import clear_captured_thinking, get_captured_thinking
+    from retrieval_pipeline import HybridRetriever
+
+    fallback_chat_engine = state.fallback_chat_engine
+    if fallback_chat_engine is None:
+        return
+
+    pre_retry_issues = list(validation.issues)
+    pre_retry_text = state.assistant_text if not is_empty_llm_output(state.assistant_text) else ""
+    pre_retry_thinking = state.thinking_text
+    retry_failed_message: str | None = None
+
+    yield format_sse(
+        "status",
+        {
+            "message": _retry_status_message(pre_retry_issues),
+            "reset_stream": True,
+        },
+    )
+
+    retry_prompt = build_retry_prompt(state.prompt, validation)
+    clear_captured_thinking(state.stack.capture_llm)
+    hybrid_retriever = state.hybrid_retriever
+    prior_forced_profile = getattr(hybrid_retriever, "forced_profile", None)
+    if isinstance(hybrid_retriever, HybridRetriever):
+        hybrid_retriever.forced_profile = "pericial"
+
+    retry_resp = None
+    try:
+        runtime_settings = state.runtime_settings
+        model_name = state.model_name
+        capture_llm = state.stack.capture_llm
+        stream_stats = state.stream_stats
+
+        start_timeout_s = float(
+            getattr(runtime_settings, "chat_stream_start_timeout_s", _STREAM_START_TIMEOUT_S)
+        )
+        queued = _model_generation_is_busy(model_name)
+        if queued:
+            yield format_sse(
+                "status",
+                {
+                    "message": (
+                        f"Modelo {model_name} ocupado; retry na fila "
+                        "aguardando a geracao anterior terminar..."
+                    )
+                },
+            )
+        retry_resp = _call_with_timeout(
+            lambda: fallback_chat_engine.stream_chat(retry_prompt),
+            timeout_s=start_timeout_s,
+            label="retry_stream_start",
+        )
+        if queued:
+            yield format_sse(
+                "status",
+                {"message": "Modelo liberado; iniciando retry..."},
+            )
+        state.assistant_text = ""
+        state.thinking_text = None
+        gen_retry = getattr(retry_resp, "response_gen", None)
+        if gen_retry is not None:
+            idle_timeout_s = float(
+                getattr(runtime_settings, "chat_stream_idle_timeout_s", _STREAM_IDLE_TIMEOUT_S)
+            )
+            for piece, think_snap in _stream_tokens_with_idle_timeout(
+                gen_retry,
+                capture_llm,
+                idle_timeout_s=idle_timeout_s,
+                stats=stream_stats,
+            ):
+                if think_snap:
+                    state.thinking_text = think_snap
+                    yield format_sse("thinking", {"text": think_snap})
+                if piece:
+                    state.assistant_text += piece
+                    yield format_sse("token", {"text": piece})
+            state.assistant_text = coalesce_assistant_reply(
+                state.assistant_text,
+                retry_resp,
+                fallback_chat_engine,
+            )
+        else:
+            state.assistant_text = coalesce_assistant_reply(
+                getattr(retry_resp, "response", "") or "",
+                retry_resp,
+                fallback_chat_engine,
+            )
+            if state.assistant_text:
+                yield format_sse("token", {"text": state.assistant_text})
+            state.thinking_text = get_captured_thinking(
+                capture_llm
+            ) or _extract_thinking(retry_resp)
+            if state.thinking_text:
+                yield format_sse("thinking", {"text": state.thinking_text})
+
+        if is_empty_llm_output(state.assistant_text):
+            recovered, recovered_thinking = _sync_chat_reply(
+                fallback_chat_engine,
+                retry_prompt,
+                capture_llm,
+            )
+            if not is_empty_llm_output(recovered):
+                state.assistant_text = recovered
+                if recovered_thinking:
+                    state.thinking_text = recovered_thinking
+                    yield format_sse("thinking", {"text": state.thinking_text})
+                yield format_sse("token", {"text": state.assistant_text})
+            elif stream_stats.thinking_updates > 0 or (
+                state.thinking_text and not state.assistant_text
+            ):
+                yield format_sse(
+                    "status",
+                    {
+                        "message": (
+                            "Modelo retornou apenas raciocinio no retry; "
+                            "repetindo geracao sem thinking..."
+                        )
+                    },
+                )
+                recovered, recovered_thinking = _recover_empty_content(
+                    fallback_chat_engine,
+                    retry_prompt,
+                    capture_llm,
+                    stream_stats,
+                )
+                if not is_empty_llm_output(recovered):
+                    state.assistant_text = recovered
+                    if recovered_thinking:
+                        state.thinking_text = recovered_thinking
+                        yield format_sse("thinking", {"text": state.thinking_text})
+                    yield format_sse("token", {"text": state.assistant_text})
+
+        if is_empty_llm_output(state.assistant_text) and not is_empty_llm_output(pre_retry_text):
+            state.assistant_text = pre_retry_text
+            state.thinking_text = pre_retry_thinking or state.thinking_text
+
+        state.thinking_text = (
+            state.thinking_text
+            or get_captured_thinking(capture_llm)
+            or (_extract_thinking(retry_resp) if retry_resp is not None else None)
+        )
+    except Exception as exc_retry:
+        retry_failed_message = f"Retry automatico falhou: {exc_retry}"
+        state.stream_interrupted = True
+        state.interruption_reason = retry_failed_message
+        if not is_empty_llm_output(pre_retry_text):
+            state.assistant_text = pre_retry_text
+            state.thinking_text = pre_retry_thinking
+        else:
+            state.stream_error_message = retry_failed_message
+    finally:
+        if isinstance(hybrid_retriever, HybridRetriever):
+            hybrid_retriever.forced_profile = prior_forced_profile
+
+    state.used_fallback = True
+    state.diagnostics = getattr(hybrid_retriever, "last_diagnostics", state.diagnostics)
+    _revalidate_after_retry(state, pre_retry_issues, retry_failed_message)
+
+
+def _revalidate_after_retry(
+    state: _ChatTurnState,
+    pre_retry_issues: list[str],
+    retry_failed_message: str | None,
+) -> None:
+    """Revalida a resposta após retry e acrescenta issues anteriores."""
+    from answer_validator import validate_answer
+
+    diagnostics = state.diagnostics
+    validation_level = _resolve_validation_level(state)
+    validation = validate_answer(
+        state.assistant_text, diagnostics, validation_level, user_query=state.prompt
+    )
+    for issue in pre_retry_issues:
+        if issue not in validation.issues:
+            validation.issues.append(issue)
+    if retry_failed_message and retry_failed_message not in validation.issues:
+        validation.issues.append(retry_failed_message)
+    state.validation = validation
+
+
+def _resolve_validation_level(state: _ChatTurnState) -> str:
+    diagnostics = getattr(state.hybrid_retriever, "last_diagnostics", None)
+    if state.workspace == "free":
+        return "none"
+    if state.stack.chat_mode == "general":
+        return "none"
+    if diagnostics:
+        return state.runtime_settings.retrieval_profiles[diagnostics.plan.profile].validation_level
+    return "light"
+
+
+def _compute_telemetry(state: _ChatTurnState) -> str | None:
+    diagnostics = getattr(state.hybrid_retriever, "last_diagnostics", None)
+    if state.workspace == "free":
+        telemetry = "modo=chat_livre"
+    elif state.stack.chat_mode == "general":
+        telemetry = "modo=geral"
+    elif diagnostics:
+        telemetry = (
+            f"modo=rag | Estrategia: {diagnostics.plan.profile} ({diagnostics.plan.intent}) | "
+            f"semantico={diagnostics.semantic_count} | "
+            f"lexical={diagnostics.lexical_count} | "
+            f"fused={diagnostics.fused_count} | "
+            f"literal_hits={diagnostics.literal_count}"
+        )
+        if getattr(diagnostics, "multi_query_count", 1) > 1:
+            telemetry += f" | multi_query={diagnostics.multi_query_count}"
+        if getattr(diagnostics, "graph_expansion_count", 0):
+            telemetry += f" | cross_doc={diagnostics.graph_expansion_count}"
+        if getattr(diagnostics, "entity_boost_count", 0):
+            telemetry += f" | entity_boost={diagnostics.entity_boost_count}"
+        if getattr(diagnostics, "parent_context_count", 0):
+            telemetry += f" | parent_context={diagnostics.parent_context_count}"
+    else:
+        telemetry = None
+
+    if telemetry and state.used_fallback:
+        telemetry += " | fallback=on"
+    if telemetry and getattr(state, "validation", None) and state.validation.issues:
+        telemetry += " | validacao: " + "; ".join(state.validation.issues)
+    if telemetry:
+        telemetry += f" | gen={state.stream_stats.as_dict()}"
+    return telemetry
+
+
+def _persist_conversation(state: _ChatTurnState) -> None:
+    """Persiste mensagens e atualiza título da conversa."""
+    import conversation_store as conv_store
+    from chat_response_utils import is_empty_llm_output
+
+    rec = state.rec
+    project_id = state.project_id
+    turn_id = state.turn_id
+    prompt = state.prompt
+    assistant_text = state.assistant_text
+    thinking_text = state.thinking_text
+    telemetry = state.telemetry
+    retrieved_chunks = state.retrieved_chunks
+    validation = getattr(state, "validation", None)
+    stream_error_message = state.stream_error_message
+    stream_stats = state.stream_stats
+    diagnostics = getattr(state.hybrid_retriever, "last_diagnostics", None)
+
+    if not turn_id:
+        messages = list(state.prior_messages)
+        if not is_empty_llm_output(assistant_text):
+            messages.append({"role": "user", "content": prompt})
+            payload = {"role": "assistant", "content": assistant_text}
+            if thinking_text:
+                payload["thinking"] = thinking_text
+            if telemetry:
+                payload["telemetry"] = telemetry
+            if retrieved_chunks:
+                payload["retrieved_chunks"] = retrieved_chunks
+            if validation and validation.issues:
+                payload["validation_issues"] = validation.issues
+            messages.append(payload)
+        elif not stream_error_message:
+            stream_error_message = _empty_response_message(
+                stats=stream_stats,
+                thinking_text=thinking_text,
+                diagnostics=diagnostics,
+            )
+            logger.error(
+                "chat empty assistant response project=%s conversation=%s diag=%s thinking_len=%s",
+                project_id,
+                rec.conversation_id,
+                stream_stats.as_dict(),
+                len(thinking_text or ""),
+            )
+            state.stream_error_message = stream_error_message
+
+        rec.messages = messages
+        rec.model_name = state.model_name or rec.model_name
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        if len(user_msgs) == 1 and rec.title.strip() in ("Nova conversa", ""):
+            rec.title = _title_from_first_user_message(str(user_msgs[0].get("content", "")))
+        conv_store.save(project_id, rec)
+    else:
+        if not stream_error_message and is_empty_llm_output(assistant_text):
+            stream_error_message = _empty_response_message(
+                stats=stream_stats,
+                thinking_text=thinking_text,
+                diagnostics=diagnostics,
+            )
+            state.stream_error_message = stream_error_message
+        rec_fresh = conv_store.load(project_id, rec.conversation_id)
+        if rec_fresh is not None:
+            user_msgs = [m for m in rec_fresh.messages if m.get("role") == "user"]
+            if len(user_msgs) == 1 and rec_fresh.title.strip() in ("Nova conversa", ""):
+                rec_fresh.title = _title_from_first_user_message(
+                    str(user_msgs[0].get("content", ""))
+                )
+                conv_store.save(project_id, rec_fresh)
+
+
+def _emit_final_events(state: _ChatTurnState) -> Iterator[str]:
+    """Emite eventos finais SSE (error, meta, done)."""
+    from chat_response_utils import is_empty_llm_output
+
+    if state.stream_error_message and is_empty_llm_output(state.assistant_text):
+        yield format_sse(
+            "error",
+            {
+                "message": state.stream_error_message,
+                "generation_diag": state.stream_stats.as_dict(),
+            },
+        )
+        return
+
+    validation = getattr(state, "validation", None)
+    yield format_sse(
+        "meta",
+        {
+            "conversation_id": state.rec.conversation_id,
+            "telemetry": state.telemetry,
+            "retrieved_chunks": state.retrieved_chunks,
+            "validation_issues": validation.issues if validation else [],
+            "generation_diag": state.stream_stats.as_dict(),
+        },
+    )
+    done_payload = {
+        "assistant_text": state.assistant_text,
+        "thinking": state.thinking_text,
+        "conversation_id": state.rec.conversation_id,
+        "interrupted": state.stream_interrupted,
+        "interruption_reason": state.interruption_reason,
+        "generation_diag": state.stream_stats.as_dict(),
+    }
+    if state.telemetry:
+        done_payload["telemetry"] = state.telemetry
+    if state.retrieved_chunks:
+        done_payload["retrieved_chunks"] = state.retrieved_chunks
+    if validation and validation.issues:
+        done_payload["validation_issues"] = validation.issues
+    yield format_sse("done", done_payload)
+
+
+def run_chat_turn(
+    *,
+    project_id: str,
+    conversation_id: str | None,
+    message: str,
+    model: str,
+    workspace: str,
+    profile: str | None = None,
+    audit_mode: bool = False,
+    use_project_memory: bool = True,
+    session_rules: str = "",
+    create_conversation: bool = False,
+    turn_id: str | None = None,
+) -> Iterator[str]:
+    """Generator de linhas SSE para um turno de chat."""
+    from answer_validator import validate_answer
+    from app_workspace import should_run_audit_synthesis
+    from chat_response_utils import is_empty_llm_output
+    from llm_thinking import clear_captured_thinking
+    from retrieval_pipeline import HybridRetriever
+
+    state = _load_turn_state(
+        project_id=project_id,
+        conversation_id=conversation_id,
+        message=message,
+        model=model,
+        workspace=workspace,
+        profile=profile,
+        audit_mode=audit_mode,
+        use_project_memory=use_project_memory,
+        session_rules=session_rules,
+        create_conversation=create_conversation,
+        turn_id=turn_id,
+    )
+
+    if state.stream_stats.repeat_question:
         yield format_sse(
             "status",
             {"message": "Pergunta repetida: pulando condensacao do historico..."},
         )
 
-    hybrid_retriever = stack.hybrid_retriever
     yield format_sse("status", {"message": "Recuperando contexto e preparando resposta..."})
-
-    assistant_text = ""
-    thinking_text = None
-    used_fallback = False
-    stream_interrupted = False
-    interruption_reason: str | None = None
-    stream_error_message: str | None = None
-    telemetry = None
-    retrieved_chunks: list[dict] = []
-    effective_prompt = prompt
-    use_audit_synthesis = False
-    use_analytical_synthesis = False
-
-    clear_captured_thinking(stack.capture_llm)
+    clear_captured_thinking(state.stack.capture_llm)
 
     try:
-        if workspace == "rag" and isinstance(hybrid_retriever, HybridRetriever):
-            plan_pre = plan_query(
-                effective_prompt, runtime_settings, forced_profile=forced_profile
-            )
+        if state.workspace == "rag" and isinstance(state.hybrid_retriever, HybridRetriever):
             run_audit = should_run_audit_synthesis(
-                effective_prompt,
-                runtime_settings,
-                forced_profile=forced_profile,
-                audit_mode_ui=audit_mode,
+                state.effective_prompt,
+                state.runtime_settings,
+                forced_profile=_resolve_forced_profile(state.profile),
+                audit_mode_ui=state.audit_mode,
             )
-            run_analytical = (
-                not run_audit
-                and should_run_analytical_synthesis(
-                    effective_prompt,
-                    plan_pre,
-                    enabled=runtime_settings.analytical_map_reduce_enabled,
-                )
-            )
-
             if run_audit:
-                expanded = expand_query(
-                    effective_prompt,
-                    project_memory=hybrid_retriever.project_memory,
-                    intent="auditoria_exaustiva",
-                )
-                _, audit_pages = search_exhaustive(
-                    hybrid_retriever.lexical_index,
-                    expanded,
-                    batch_size=runtime_settings.exhaustive_batch_size,
-                    max_total=runtime_settings.exhaustive_max_hits,
-                    page_filter=plan_pre.requested_page,
-                    page_range=plan_pre.requested_page_range,
-                    source_hint=plan_pre.requested_source_hint,
-                )
-                if len(audit_pages) >= runtime_settings.audit_map_reduce_threshold:
-                    use_audit_synthesis = True
-                    yield format_sse(
-                        "status",
-                        {
-                            "message": f"Modo auditoria: {len(audit_pages)} paginas, sintese em lotes..."
-                        },
-                    )
+                yield from _run_audit_synthesis(state)
 
-                    def _audit_progress(i: int, total: int, phase: str) -> None:
-                        pass
+            if not state.use_audit_synthesis:
+                yield from _run_analytical_synthesis(state)
 
-                    if _model_generation_is_busy(model_name):
-                        yield format_sse(
-                            "status",
-                            {
-                                "message": (
-                                    f"Modelo {model_name} ocupado; pergunta na fila "
-                                    "aguardando a geracao anterior terminar..."
-                                )
-                            },
-                        )
-                    lease = _acquire_model_generation_slot(model_name)
-                    try:
-                        assistant_text = run_audit_synthesis(
-                            stack.capture_llm.llm,
-                            effective_prompt,
-                            audit_pages,
-                            pages_per_batch=runtime_settings.audit_pages_per_batch,
-                            progress_callback=_audit_progress,
-                        )
-                    finally:
-                        _release_model_generation_slot(lease)
-                    if assistant_text:
-                        yield format_sse("token", {"text": assistant_text})
-                    hybrid_retriever.retrieve(QueryBundle(query_str=expanded))
-                elif audit_pages:
-                    effective_prompt = (
-                        f"{effective_prompt}\n\n[Contexto varredura lexical]\n"
-                        f"{format_audit_context(audit_pages)}"
-                    )
-
-            elif run_analytical:
-                prior_profile = getattr(hybrid_retriever, "forced_profile", None)
-                if forced_profile is None and plan_pre.profile != "pericial":
-                    hybrid_retriever.forced_profile = "pericial"
-                fused_nodes = hybrid_retriever.retrieve(QueryBundle(query_str=effective_prompt))
-                if prior_profile is not None:
-                    hybrid_retriever.forced_profile = prior_profile
-                elif forced_profile is None:
-                    hybrid_retriever.forced_profile = None
-
-                if len(fused_nodes) >= runtime_settings.analytical_map_reduce_min_chunks:
-                    use_analytical_synthesis = True
-                    yield format_sse(
-                        "status",
-                        {
-                            "message": (
-                                f"Modo analitico: {len(fused_nodes)} trechos, "
-                                "sintese em lotes..."
-                            )
-                        },
-                    )
-                    lease = _acquire_model_generation_slot(model_name)
-                    try:
-                        assistant_text = run_analytical_synthesis(
-                            stack.capture_llm.llm,
-                            effective_prompt,
-                            fused_nodes,
-                            chunks_per_batch=runtime_settings.analytical_chunks_per_batch,
-                            max_batches=runtime_settings.analytical_max_batches,
-                        )
-                    finally:
-                        _release_model_generation_slot(lease)
-                    if assistant_text:
-                        yield format_sse("token", {"text": assistant_text})
-                    retrieved_chunks = nodes_to_serializable(fused_nodes)
-
-        if not use_audit_synthesis and not use_analytical_synthesis:
-            start_timeout_s = float(
-                getattr(runtime_settings, "chat_stream_start_timeout_s", _STREAM_START_TIMEOUT_S)
+        if not state.use_audit_synthesis and not state.use_analytical_synthesis:
+            yield from _stream_response_from_engine(
+                state,
+                state.chat_engine,
+                state.effective_prompt,
+                label_prefix="pergunta",
             )
-            queued_for_initial = _model_generation_is_busy(model_name)
-            if queued_for_initial:
-                yield format_sse(
-                    "status",
-                    {
-                        "message": (
-                            f"Modelo {model_name} ocupado; pergunta na fila "
-                            "aguardando a geracao anterior terminar..."
-                        )
-                    },
-                )
-            stream_resp = _call_with_timeout(
-                lambda: chat_engine.stream_chat(effective_prompt),
-                timeout_s=start_timeout_s,
-                label="chat_stream_start",
-            )
-            if queued_for_initial:
-                yield format_sse(
-                    "status",
-                    {"message": "Modelo liberado; iniciando resposta..."},
-                )
-            gen = getattr(stream_resp, "response_gen", None)
-            if gen is not None:
-                idle_timeout_s = float(
-                    getattr(runtime_settings, "chat_stream_idle_timeout_s", _STREAM_IDLE_TIMEOUT_S)
-                )
-                for piece, think_snap in _stream_tokens_with_idle_timeout(
-                    gen,
-                    stack.capture_llm,
-                    idle_timeout_s=idle_timeout_s,
-                    stats=stream_stats,
-                ):
-                    if think_snap:
-                        thinking_text = think_snap
-                        yield format_sse("thinking", {"text": think_snap})
-                    if piece:
-                        assistant_text += piece
-                        yield format_sse("token", {"text": piece})
-                assistant_text = coalesce_assistant_reply(
-                    assistant_text,
-                    stream_resp,
-                    chat_engine,
-                )
-                if is_empty_llm_output(assistant_text):
-                    recovered, recovered_thinking = _sync_chat_reply(
-                        chat_engine,
-                        effective_prompt,
-                        stack.capture_llm,
-                    )
-                    if not is_empty_llm_output(recovered):
-                        assistant_text = recovered
-                        if recovered_thinking:
-                            thinking_text = recovered_thinking
-                        yield format_sse("token", {"text": assistant_text})
-                    elif stream_stats.thinking_updates > 0:
-                        yield format_sse(
-                            "status",
-                            {
-                                "message": (
-                                    "Modelo retornou apenas raciocinio; "
-                                    "repetindo geracao sem thinking..."
-                                )
-                            },
-                        )
-                        recovered, recovered_thinking = _recover_empty_content(
-                            chat_engine,
-                            effective_prompt,
-                            stack.capture_llm,
-                            stream_stats,
-                        )
-                        if not is_empty_llm_output(recovered):
-                            assistant_text = recovered
-                            if recovered_thinking:
-                                thinking_text = recovered_thinking
-                            yield format_sse("token", {"text": assistant_text})
-            else:
-                assistant_text = coalesce_assistant_reply(
-                    getattr(stream_resp, "response", "") or "",
-                    stream_resp,
-                    chat_engine,
-                )
-                if assistant_text:
-                    yield format_sse("token", {"text": assistant_text})
-                thinking_text = get_captured_thinking(stack.capture_llm) or _extract_thinking(
-                    stream_resp
-                )
-                if thinking_text:
-                    yield format_sse("thinking", {"text": thinking_text})
-
-            thinking_text = (
-                thinking_text
-                or get_captured_thinking(stack.capture_llm)
-                or _extract_thinking(stream_resp)
-            )
-            if is_empty_llm_output(assistant_text):
-                recovered, recovered_thinking = _sync_chat_reply(
-                    chat_engine,
-                    effective_prompt,
-                    stack.capture_llm,
-                )
-                if not is_empty_llm_output(recovered):
-                    assistant_text = recovered
-                    if recovered_thinking:
-                        thinking_text = recovered_thinking
-                    yield format_sse("token", {"text": assistant_text})
-                elif stream_stats.thinking_updates > 0 or (
-                    thinking_text and not assistant_text
-                ):
-                    yield format_sse(
-                        "status",
-                        {
-                            "message": (
-                                "Modelo retornou apenas raciocinio; "
-                                "repetindo geracao sem thinking..."
-                            )
-                        },
-                    )
-                    recovered, recovered_thinking = _recover_empty_content(
-                        chat_engine,
-                        effective_prompt,
-                        stack.capture_llm,
-                        stream_stats,
-                    )
-                    if not is_empty_llm_output(recovered):
-                        assistant_text = recovered
-                        if recovered_thinking:
-                            thinking_text = recovered_thinking
-                        yield format_sse("token", {"text": assistant_text})
-
     except Exception as exc:
         msg = str(exc).lower()
-        if workspace == "rag" and fallback_chat_engine and _reranker_runtime_error(msg):
-            used_fallback = True
-            yield format_sse("status", {"message": "Reranker falhou; respondendo sem reranker."})
-            try:
-                clear_captured_thinking(stack.capture_llm)
-                start_timeout_s = float(
-                    getattr(runtime_settings, "chat_stream_start_timeout_s", _STREAM_START_TIMEOUT_S)
-                )
-                queued_for_fallback = _model_generation_is_busy(model_name)
-                if queued_for_fallback:
-                    yield format_sse(
-                        "status",
-                        {
-                            "message": (
-                                f"Modelo {model_name} ocupado; fallback na fila "
-                                "aguardando a geracao anterior terminar..."
-                            )
-                        },
-                    )
-                stream_fb = _call_with_timeout(
-                    lambda: fallback_chat_engine.stream_chat(prompt),
-                    timeout_s=start_timeout_s,
-                    label="fallback_stream_start",
-                )
-                if queued_for_fallback:
-                    yield format_sse(
-                        "status",
-                        {"message": "Modelo liberado; iniciando fallback..."},
-                    )
-                gen_fb = getattr(stream_fb, "response_gen", None)
-                assistant_text = ""
-                if gen_fb is not None:
-                    idle_timeout_s = float(
-                        getattr(runtime_settings, "chat_stream_idle_timeout_s", _STREAM_IDLE_TIMEOUT_S)
-                    )
-                    for piece, think_snap in _stream_tokens_with_idle_timeout(
-                        gen_fb,
-                        stack.capture_llm,
-                        idle_timeout_s=idle_timeout_s,
-                        stats=stream_stats,
-                    ):
-                        if think_snap:
-                            thinking_text = think_snap
-                            yield format_sse("thinking", {"text": think_snap})
-                        if piece:
-                            assistant_text += piece
-                            yield format_sse("token", {"text": piece})
-                    if not assistant_text:
-                        assistant_text = (
-                            getattr(stream_fb, "response", None)
-                            or getattr(stream_fb, "unformatted_response", None)
-                            or ""
-                        )
-                else:
-                    assistant_text = getattr(stream_fb, "response", "") or ""
-                    if assistant_text:
-                        yield format_sse("token", {"text": assistant_text})
-                    thinking_text = get_captured_thinking(
-                        stack.capture_llm
-                    ) or _extract_thinking(stream_fb)
-            except Exception as exc_fb:
-                stream_error_message = f"Falha no fallback: {exc_fb}"
-                stream_interrupted = True
-                interruption_reason = stream_error_message
+        if state.workspace == "rag" and state.fallback_chat_engine and _reranker_runtime_error(msg):
+            yield from _run_fallback_response(state, exc)
         else:
-            stream_error_message = str(exc)
-            stream_interrupted = True
-            interruption_reason = stream_error_message
+            state.stream_error_message = str(exc)
+            state.stream_interrupted = True
+            state.interruption_reason = state.stream_error_message
 
-    diagnostics = getattr(hybrid_retriever, "last_diagnostics", None)
-    if workspace == "free":
-        validation_level = "none"
-    elif stack.chat_mode == "general":
-        validation_level = "none"
-    else:
-        validation_level = "light"
-        if diagnostics:
-            validation_level = runtime_settings.retrieval_profiles[
-                diagnostics.plan.profile
-            ].validation_level
+    validation_level = _resolve_validation_level(state)
+    diagnostics = getattr(state.hybrid_retriever, "last_diagnostics", None)
 
-    if turn_id and assistant_text.strip():
+    if state.turn_id and state.assistant_text.strip():
         yield format_sse("status", {"message": "Validando resposta e finalizando..."})
+
     validation = validate_answer(
-        assistant_text, diagnostics, validation_level, user_query=prompt
+        state.assistant_text, diagnostics, validation_level, user_query=state.prompt
     )
-    if stream_interrupted:
+    if state.stream_interrupted:
         interruption_issue = (
             "Resposta interrompida durante stream. Revise e, se necessario, repita a pergunta."
         )
         if interruption_issue not in validation.issues:
             validation.issues.append(interruption_issue)
+
+    runtime_settings = state.runtime_settings
     low_cov_fused_threshold = getattr(runtime_settings, "low_cov_fused_threshold", 0)
     auto_retry_on_low_coverage = getattr(runtime_settings, "auto_retry_on_low_coverage", False)
     low_coverage_runtime = (
-        workspace == "rag"
+        state.workspace == "rag"
         and diagnostics is not None
         and low_cov_fused_threshold > 0
         and diagnostics.plan.intent in ("analitico", "padrao", "historico_documental", "tese_acusacao_defesa")
@@ -936,291 +1427,39 @@ def run_chat_turn(
                 "Amplie a cobertura com foco nos documentos correlatos e cite paginas antes de "
                 "afirmar ausencia de mencao."
             )
-    if _should_skip_retry_for_cosmetic_validation(validation, assistant_text):
+
+    if _should_skip_retry_for_cosmetic_validation(validation, state.assistant_text):
         validation.should_retry = False
         validation.retry_hint = None
+
     if (
         validation.should_retry
-        and workspace == "rag"
-        and fallback_chat_engine
-        and _model_generation_has_contention(model_name)
+        and state.workspace == "rag"
+        and state.fallback_chat_engine
+        and _model_generation_has_contention(state.model_name)
     ):
         retry_deferred_message = (
             "Retry automatico adiado porque outro turno aguarda o modelo; "
             "resposta inicial preservada."
         )
-        stream_interrupted = True
-        interruption_reason = retry_deferred_message
+        state.stream_interrupted = True
+        state.interruption_reason = retry_deferred_message
         validation.should_retry = False
         if retry_deferred_message not in validation.issues:
             validation.issues.append(retry_deferred_message)
 
-    if (
-        validation.should_retry
-        and workspace == "rag"
-        and fallback_chat_engine
-    ):
-        pre_retry_issues = list(validation.issues)
-        pre_retry_text = assistant_text if not is_empty_llm_output(assistant_text) else ""
-        pre_retry_thinking = thinking_text
-        retry_failed_message: str | None = None
-        yield format_sse(
-            "status",
-            {
-                "message": _retry_status_message(pre_retry_issues),
-                "reset_stream": True,
-            },
-        )
-        retry_prompt = build_retry_prompt(prompt, validation)
-        clear_captured_thinking(stack.capture_llm)
-        prior_forced_profile = getattr(hybrid_retriever, "forced_profile", None)
-        if isinstance(hybrid_retriever, HybridRetriever):
-            hybrid_retriever.forced_profile = "pericial"
-        retry_resp = None
-        try:
-            start_timeout_s = float(
-                getattr(runtime_settings, "chat_stream_start_timeout_s", _STREAM_START_TIMEOUT_S)
-            )
-            queued_for_retry = _model_generation_is_busy(model_name)
-            if queued_for_retry:
-                yield format_sse(
-                    "status",
-                    {
-                        "message": (
-                            f"Modelo {model_name} ocupado; retry na fila "
-                            "aguardando a geracao anterior terminar..."
-                        )
-                    },
-                )
-            retry_resp = _call_with_timeout(
-                lambda: fallback_chat_engine.stream_chat(retry_prompt),
-                timeout_s=start_timeout_s,
-                label="retry_stream_start",
-            )
-            if queued_for_retry:
-                yield format_sse(
-                    "status",
-                    {"message": "Modelo liberado; iniciando retry..."},
-                )
-            assistant_text = ""
-            thinking_text = None
-            gen_retry = getattr(retry_resp, "response_gen", None)
-            if gen_retry is not None:
-                idle_timeout_s = float(
-                    getattr(runtime_settings, "chat_stream_idle_timeout_s", _STREAM_IDLE_TIMEOUT_S)
-                )
-                for piece, think_snap in _stream_tokens_with_idle_timeout(
-                    gen_retry,
-                    stack.capture_llm,
-                    idle_timeout_s=idle_timeout_s,
-                    stats=stream_stats,
-                ):
-                    if think_snap:
-                        thinking_text = think_snap
-                        yield format_sse("thinking", {"text": think_snap})
-                    if piece:
-                        assistant_text += piece
-                        yield format_sse("token", {"text": piece})
-                assistant_text = coalesce_assistant_reply(
-                    assistant_text,
-                    retry_resp,
-                    fallback_chat_engine,
-                )
-            else:
-                assistant_text = coalesce_assistant_reply(
-                    getattr(retry_resp, "response", "") or "",
-                    retry_resp,
-                    fallback_chat_engine,
-                )
-                if assistant_text:
-                    yield format_sse("token", {"text": assistant_text})
-                thinking_text = get_captured_thinking(
-                    stack.capture_llm
-                ) or _extract_thinking(retry_resp)
-                if thinking_text:
-                    yield format_sse("thinking", {"text": thinking_text})
-            if is_empty_llm_output(assistant_text):
-                recovered, recovered_thinking = _sync_chat_reply(
-                    fallback_chat_engine,
-                    retry_prompt,
-                    stack.capture_llm,
-                )
-                if not is_empty_llm_output(recovered):
-                    assistant_text = recovered
-                    if recovered_thinking:
-                        thinking_text = recovered_thinking
-                        yield format_sse("thinking", {"text": thinking_text})
-                    yield format_sse("token", {"text": assistant_text})
-                elif stream_stats.thinking_updates > 0 or (
-                    thinking_text and not assistant_text
-                ):
-                    yield format_sse(
-                        "status",
-                        {
-                            "message": (
-                                "Modelo retornou apenas raciocinio no retry; "
-                                "repetindo geracao sem thinking..."
-                            )
-                        },
-                    )
-                    recovered, recovered_thinking = _recover_empty_content(
-                        fallback_chat_engine,
-                        retry_prompt,
-                        stack.capture_llm,
-                        stream_stats,
-                    )
-                    if not is_empty_llm_output(recovered):
-                        assistant_text = recovered
-                        if recovered_thinking:
-                            thinking_text = recovered_thinking
-                            yield format_sse("thinking", {"text": thinking_text})
-                        yield format_sse("token", {"text": assistant_text})
-            if is_empty_llm_output(assistant_text) and not is_empty_llm_output(pre_retry_text):
-                assistant_text = pre_retry_text
-                thinking_text = pre_retry_thinking or thinking_text
-            thinking_text = (
-                thinking_text
-                or get_captured_thinking(stack.capture_llm)
-                or (_extract_thinking(retry_resp) if retry_resp is not None else None)
-            )
-        except Exception as exc_retry:
-            retry_failed_message = f"Retry automatico falhou: {exc_retry}"
-            stream_interrupted = True
-            interruption_reason = retry_failed_message
-            if not is_empty_llm_output(pre_retry_text):
-                assistant_text = pre_retry_text
-                thinking_text = pre_retry_thinking
-            else:
-                stream_error_message = retry_failed_message
-        finally:
-            if isinstance(hybrid_retriever, HybridRetriever):
-                hybrid_retriever.forced_profile = prior_forced_profile
-        used_fallback = True
-        diagnostics = getattr(hybrid_retriever, "last_diagnostics", diagnostics)
-        validation = validate_answer(
-            assistant_text, diagnostics, validation_level, user_query=prompt
-        )
-        for issue in pre_retry_issues:
-            if issue not in validation.issues:
-                validation.issues.append(issue)
-        if retry_failed_message and retry_failed_message not in validation.issues:
-            validation.issues.append(retry_failed_message)
+    state.validation = validation
 
-    if workspace == "free":
-        telemetry = "modo=chat_livre"
-    elif stack.chat_mode == "general":
-        telemetry = "modo=geral"
-    elif diagnostics:
-        telemetry = (
-            f"modo=rag | Estrategia: {diagnostics.plan.profile} ({diagnostics.plan.intent}) | "
-            f"semantico={diagnostics.semantic_count} | "
-            f"lexical={diagnostics.lexical_count} | "
-            f"fused={diagnostics.fused_count} | "
-            f"literal_hits={diagnostics.literal_count}"
-        )
-        if getattr(diagnostics, "multi_query_count", 1) > 1:
-            telemetry += f" | multi_query={diagnostics.multi_query_count}"
-        if getattr(diagnostics, "graph_expansion_count", 0):
-            telemetry += f" | cross_doc={diagnostics.graph_expansion_count}"
-        if getattr(diagnostics, "entity_boost_count", 0):
-            telemetry += f" | entity_boost={diagnostics.entity_boost_count}"
-        if getattr(diagnostics, "parent_context_count", 0):
-            telemetry += f" | parent_context={diagnostics.parent_context_count}"
-    if telemetry and used_fallback:
-        telemetry += " | fallback=on"
-    if telemetry and validation.issues:
-        telemetry += " | validacao: " + "; ".join(validation.issues)
-    if telemetry:
-        telemetry += f" | gen={stream_stats.as_dict()}"
+    if validation.should_retry and state.workspace == "rag" and state.fallback_chat_engine:
+        yield from _run_retry(state, validation)
 
-    if workspace == "rag" and isinstance(hybrid_retriever, HybridRetriever):
-        retrieved_chunks = nodes_to_serializable(hybrid_retriever.last_retrieved_nodes)
+    if state.workspace == "rag" and isinstance(state.hybrid_retriever, HybridRetriever):
+        from retrieved_chunks_ui import nodes_to_serializable
+        state.retrieved_chunks = nodes_to_serializable(state.hybrid_retriever.last_retrieved_nodes)
 
-    if not turn_id:
-        messages = list(prior_messages)
-        if not is_empty_llm_output(assistant_text):
-            messages.append({"role": "user", "content": prompt})
-            payload = {"role": "assistant", "content": assistant_text}
-            if thinking_text:
-                payload["thinking"] = thinking_text
-            if telemetry:
-                payload["telemetry"] = telemetry
-            if retrieved_chunks:
-                payload["retrieved_chunks"] = retrieved_chunks
-            if validation.issues:
-                payload["validation_issues"] = validation.issues
-            messages.append(payload)
-        elif not stream_error_message:
-            stream_error_message = _empty_response_message(
-                stats=stream_stats,
-                thinking_text=thinking_text,
-                diagnostics=diagnostics,
-            )
-            logger.error(
-                "chat empty assistant response project=%s conversation=%s diag=%s thinking_len=%s",
-                project_id,
-                rec.conversation_id,
-                stream_stats.as_dict(),
-                len(thinking_text or ""),
-            )
-
-        rec.messages = messages
-        rec.model_name = model_name or rec.model_name
-        user_msgs = [m for m in messages if m.get("role") == "user"]
-        if len(user_msgs) == 1 and rec.title.strip() in ("Nova conversa", ""):
-            rec.title = _title_from_first_user_message(str(user_msgs[0].get("content", "")))
-        conv_store.save(project_id, rec)
-    else:
-        if not stream_error_message and is_empty_llm_output(assistant_text):
-            stream_error_message = _empty_response_message(
-                stats=stream_stats,
-                thinking_text=thinking_text,
-                diagnostics=diagnostics,
-            )
-        rec_fresh = conv_store.load(project_id, rec.conversation_id)
-        if rec_fresh is not None:
-            user_msgs = [m for m in rec_fresh.messages if m.get("role") == "user"]
-            if len(user_msgs) == 1 and rec_fresh.title.strip() in ("Nova conversa", ""):
-                rec_fresh.title = _title_from_first_user_message(
-                    str(user_msgs[0].get("content", ""))
-                )
-                conv_store.save(project_id, rec_fresh)
-
-    if stream_error_message and is_empty_llm_output(assistant_text):
-        yield format_sse(
-            "error",
-            {
-                "message": stream_error_message,
-                "generation_diag": stream_stats.as_dict(),
-            },
-        )
-        return
-
-    yield format_sse(
-        "meta",
-        {
-            "conversation_id": rec.conversation_id,
-            "telemetry": telemetry,
-            "retrieved_chunks": retrieved_chunks,
-            "validation_issues": validation.issues,
-            "generation_diag": stream_stats.as_dict(),
-        },
-    )
-    done_payload = {
-        "assistant_text": assistant_text,
-        "thinking": thinking_text,
-        "conversation_id": rec.conversation_id,
-        "interrupted": stream_interrupted,
-        "interruption_reason": interruption_reason,
-        "generation_diag": stream_stats.as_dict(),
-    }
-    if telemetry:
-        done_payload["telemetry"] = telemetry
-    if retrieved_chunks:
-        done_payload["retrieved_chunks"] = retrieved_chunks
-    if validation.issues:
-        done_payload["validation_issues"] = validation.issues
-    yield format_sse("done", done_payload)
+    state.telemetry = _compute_telemetry(state)
+    _persist_conversation(state)
+    yield from _emit_final_events(state)
 
 
 def start_async_chat_turn(
@@ -1274,6 +1513,7 @@ async def async_chat_sse(**kwargs) -> AsyncIterator[str]:
     for line in run_chat_turn(**kwargs):
         yield line
         await _async_yield()
+
 
 async def _async_yield():
     import asyncio

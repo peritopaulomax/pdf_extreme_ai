@@ -14,6 +14,10 @@ from core.bootstrap import bootstrap_legacy  # noqa: E402
 
 bootstrap_legacy()
 
+from core.logging_config import configure_logging  # noqa: E402
+
+configure_logging()
+
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(_BACKEND.parent / ".env")
@@ -38,18 +42,37 @@ from api import (  # noqa: E402
 )
 from auth.dependencies import require_auth  # noqa: E402
 from auth.store import ensure_auth_dir  # noqa: E402
+from core.logging_config import get_logger  # noqa: E402
 
 ensure_auth_dir()
+logger = get_logger(__name__)
 
-_SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip() or "dev-change-me-in-production"
-_CORS_ORIGINS = [
-    o.strip()
-    for o in os.environ.get(
-        "CORS_ORIGINS",
-        "http://127.0.0.1:5173,http://localhost:5173",
-    ).split(",")
-    if o.strip()
-]
+_ENV = (os.environ.get("ENVIRONMENT") or os.environ.get("ENV", "")).strip().lower()
+_IS_PROD = _ENV in ("production", "prod")
+
+_session_secret_raw = os.environ.get("SESSION_SECRET", "").strip()
+if not _session_secret_raw:
+    if _IS_PROD:
+        raise RuntimeError(
+            "SESSION_SECRET deve estar configurado em producao. "
+            "Defina SESSION_SECRET no .env ou nas variaveis de ambiente."
+        )
+    _session_secret_raw = "dev-change-me-in-production"
+    logger.warning(
+        "SESSION_SECRET nao configurado; usando secret de desenvolvimento. "
+        "Configure SESSION_SECRET antes de deployar em producao."
+    )
+_SESSION_SECRET = _session_secret_raw
+
+_cors_origins_raw = os.environ.get("CORS_ORIGINS", "").strip()
+if not _cors_origins_raw:
+    if _IS_PROD:
+        raise RuntimeError(
+            "CORS_ORIGINS deve estar configurado em producao. "
+            "Defina CORS_ORIGINS no .env ou nas variaveis de ambiente."
+        )
+    _cors_origins_raw = "http://127.0.0.1:5173,http://localhost:5173"
+_CORS_ORIGINS = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
 
 app = FastAPI(
     title="PDF Extreme AI API",

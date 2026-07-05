@@ -189,8 +189,8 @@ def _install_chat_legacy_fakes(monkeypatch, *, should_retry: bool = False, valid
     monkeypatch.setitem(sys.modules, "answer_validator", answer_validator)
 
     chat_memory = types.ModuleType("chat_memory")
-    chat_memory.rehydrate_memory_from_messages = lambda memory, messages: None
-    chat_memory.sync_memory_with_session = lambda memory, messages: None
+    chat_memory.rehydrate_memory_from_messages = lambda memory, messages, **kwargs: None
+    chat_memory.sync_memory_with_session = lambda memory, messages, **kwargs: None
     monkeypatch.setitem(sys.modules, "chat_memory", chat_memory)
 
     chat_response_utils = types.ModuleType("chat_response_utils")
@@ -226,7 +226,26 @@ def _install_chat_legacy_fakes(monkeypatch, *, should_retry: bool = False, valid
         def __init__(self, query_str: str):
             self.query_str = query_str
 
+    class MetadataMode:
+        NONE = "none"
+
+    class TextNode:
+        def __init__(self, text: str = "", metadata: dict | None = None):
+            self.text = text
+            self.metadata = metadata or {}
+
+        def get_content(self, metadata_mode=None):
+            return self.text
+
+    class NodeWithScore:
+        def __init__(self, node=None, score: float = 0.0):
+            self.node = node or TextNode()
+            self.score = score
+
     llama_schema.QueryBundle = QueryBundle
+    llama_schema.MetadataMode = MetadataMode
+    llama_schema.TextNode = TextNode
+    llama_schema.NodeWithScore = NodeWithScore
     monkeypatch.setitem(sys.modules, "llama_index.core.schema", llama_schema)
 
     llm_thinking = types.ModuleType("llm_thinking")
@@ -239,7 +258,17 @@ def _install_chat_legacy_fakes(monkeypatch, *, should_retry: bool = False, valid
     monkeypatch.setitem(sys.modules, "query_expansion", query_expansion)
 
     query_planner = types.ModuleType("query_planner")
-    query_planner.plan_query = lambda query, settings, forced_profile=None: types.SimpleNamespace(
+
+    class QueryPlan:
+        def __init__(self, profile, intent, requested_page=None, requested_page_range=None, requested_source_hint=None):
+            self.profile = profile
+            self.intent = intent
+            self.requested_page = requested_page
+            self.requested_page_range = requested_page_range
+            self.requested_source_hint = requested_source_hint
+
+    query_planner.QueryPlan = QueryPlan
+    query_planner.plan_query = lambda query, settings, forced_profile=None: QueryPlan(
         profile="preciso",
         intent="padrao",
         requested_page=None,
@@ -283,6 +312,12 @@ def _install_chat_legacy_fakes(monkeypatch, *, should_retry: bool = False, valid
         exhaustive_max_hits=250,
         audit_map_reduce_threshold=99,
         audit_pages_per_batch=10,
+        analytical_map_reduce_enabled=False,
+        analytical_map_reduce_min_chunks=10,
+        analytical_chunks_per_batch=5,
+        analytical_max_batches=6,
+        low_cov_fused_threshold=0,
+        auto_retry_on_low_coverage=False,
         retrieval_profiles={"preciso": types.SimpleNamespace(validation_level="light")},
     )
     monkeypatch.setitem(sys.modules, "runtime_config", runtime_config)

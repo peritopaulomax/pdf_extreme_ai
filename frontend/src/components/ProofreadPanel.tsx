@@ -2,6 +2,7 @@ import { useState } from "react";
 import { streamProofread } from "../api/proofread";
 import { MODEL_OPTIONS, type ProofreadResult } from "../api/types";
 import { downloadText } from "../lib/exportMd";
+import { sanitizeHtml } from "../lib/sanitizeHtml";
 
 export function ProofreadPanel() {
   const [text, setText] = useState("");
@@ -115,7 +116,9 @@ export function ProofreadPanel() {
           {result.highlighted_html ? (
             <div
               className="proofread-highlight"
-              dangerouslySetInnerHTML={{ __html: result.highlighted_html }}
+              dangerouslySetInnerHTML={{
+                __html: sanitizeHtml(result.highlighted_html),
+              }}
             />
           ) : (
             <pre className="proofread-plain">{result.corrected_text}</pre>

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import paths
 from runtime_config import RuntimeSettings
@@ -59,19 +63,37 @@ class ProjectStore:
     def __init__(self, registry_path: str) -> None:
         self.registry_path = Path(registry_path)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_path = Path(str(self.registry_path) + ".lock")
+        self._thread_lock = threading.Lock()
         if not self.registry_path.exists():
             self._save({"projects": []})
 
+    @contextmanager
+    def _lock(self) -> Iterator[None]:
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._thread_lock:
+            # lock de processo para concorrencia entre workers/uvicorn
+            with self._lock_path.open("a", encoding="utf-8") as lock_file:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def _load(self) -> dict[str, Any]:
-        with self.registry_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        with self._lock():
+            with self.registry_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
         if "projects" not in data or not isinstance(data["projects"], list):
             data = {"projects": []}
         return data
 
     def _save(self, data: dict[str, Any]) -> None:
-        with self.registry_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=True, indent=2)
+        with self._lock():
+            tmp_path = self.registry_path.with_suffix(".tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=True, indent=2)
+            os.replace(tmp_path, self.registry_path)
 
     def list_projects(self, owner_id: str | None = None) -> list[ProjectRecord]:
         data = self._load()
@@ -86,6 +108,15 @@ class ProjectStore:
             if p.project_id == project_id:
                 return p
         return None
+
+    def delete_project(self, project_id: str) -> ProjectRecord:
+        data = self._load()
+        for idx, item in enumerate(data["projects"]):
+            if item["project_id"] == project_id:
+                removed = _record_from_dict(data["projects"].pop(idx))
+                self._save(data)
+                return removed
+        raise RuntimeError(f"Projeto nao encontrado: {project_id}")
 
     def create_project(self, name: str, owner_id: str = "") -> ProjectRecord:
         data = self._load()

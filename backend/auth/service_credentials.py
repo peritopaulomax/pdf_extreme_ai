@@ -21,6 +21,28 @@ def is_configured() -> bool:
     return _credentials_path().exists()
 
 
+def _load_or_create_key() -> bytes:
+    """Carrega ou gera chave Fernet. Prioridade: SERVICE_CREDENTIALS_KEY > arquivo .key > geracao aleatoria."""
+    ensure_auth_dir()
+    key_env = os.environ.get("SERVICE_CREDENTIALS_KEY", "").strip()
+    if key_env:
+        return key_env.encode("utf-8")
+
+    key_path = ensure_auth_dir() / "service_credentials.key"
+    if key_path.exists():
+        return key_path.read_bytes()
+
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key()
+    key_path.write_bytes(key)
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+    return key
+
+
 def save_credentials(usuario: str, senha: str) -> None:
     """Persiste credenciais criptografadas (implementação completa em lote futuro)."""
     ensure_auth_dir()
@@ -31,16 +53,8 @@ def save_credentials(usuario: str, senha: str) -> None:
             "Pacote cryptography necessário para credenciais de serviço"
         ) from exc
 
-    # Derivação simplificada por host — ver AUTH_SPEC.md para detalhes
-    import hashlib
-    import platform
-
-    host = platform.node() + platform.system() + platform.machine()
-    salt = hashlib.sha256(host.encode()).digest()[:16]
-    key = hashlib.pbkdf2_hmac("sha256", b"pdf-extreme-ai-v2", salt, 100_000, dklen=32)
-    import base64
-
-    fernet = Fernet(base64.urlsafe_b64encode(key))
+    key = _load_or_create_key()
+    fernet = Fernet(key)
     payload = json.dumps({"usuario": usuario, "senha": senha}).encode("utf-8")
     path = _credentials_path()
     path.write_bytes(fernet.encrypt(payload))
@@ -48,6 +62,23 @@ def save_credentials(usuario: str, senha: str) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def load_credentials() -> dict[str, str]:
+    """Carrega credenciais previamente salvas."""
+    path = _credentials_path()
+    if not path.exists():
+        raise FileNotFoundError("Credenciais de servico nao configuradas")
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as exc:
+        raise RuntimeError("Pacote cryptography necessário para credenciais de serviço") from exc
+
+    key = _load_or_create_key()
+    fernet = Fernet(key)
+    payload = fernet.decrypt(path.read_bytes())
+    data = json.loads(payload.decode("utf-8"))
+    return {"usuario": str(data.get("usuario", "")), "senha": str(data.get("senha", ""))}
 
 
 def clear_credentials() -> None:
