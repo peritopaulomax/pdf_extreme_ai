@@ -1,0 +1,32 @@
+# Runtime data
+data/
+qdrant_data/
+projects_registry.json
+*.db
+!data/auth/*.example
+!data/auth/.gitkeep
+
+# Secrets
+.env
+.env.local
+*.enc
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.cursor/
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+__pycache__/
